@@ -4,22 +4,25 @@ __pycache__/
 *$py.class
 *.so
 .Python
+# Build artifacts
 build/
+dist/
+*.egg-info/
+*.egg
+.eggs/
+sdist/
+
+# Package files
 reference/
 develop-eggs/
-dist/
 downloads/
 eggs/
-.eggs/
 lib/
 lib64/
 parts/
-sdist/
 var/
 wheels/
-*.egg-info/
 .installed.cfg
-*.egg
 
 # Virtual environments
 venv/
