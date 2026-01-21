@@ -1,0 +1,16 @@
+# MQTTD Requirements
+redis>=5.0.0
+
+# QUIC support (optional)
+# Note: aioquic not compatible with no-GIL Python (Limited API issue)
+# Using pure Python QUIC implementation (included) - compatible with no-GIL
+# For production-grade QUIC, install ngtcp2 C library:
+#   - ngtcp2: https://github.com/ngtcp2/ngtcp2
+#   - nghttp3: https://github.com/ngtcp2/nghttp3
+# aioquic>=0.9.20  # Commented: not compatible with no-GIL Python
+
+# Optional development dependencies
+pytest>=6.0
+pytest-asyncio>=0.18.0
+# black>=21.0
+# mypy>=0.900
