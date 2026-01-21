@@ -5,6 +5,7 @@ __pycache__/
 *.so
 .Python
 build/
+reference/
 develop-eggs/
 dist/
 downloads/
@@ -24,6 +25,8 @@ wheels/
 venv/
 env/
 ENV/
+.vmqtt/
+reference/
 
 # IDE
 .vscode/
