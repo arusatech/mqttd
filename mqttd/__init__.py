@@ -14,7 +14,7 @@ from .protocol_v5 import MQTT5Protocol
 from .properties import PropertyEncoder, PropertyType
 from .reason_codes import ReasonCode
 
-__version__ = "0.2.0"  # MQTT 5.0 support added
+__version__ = "0.3.0"  # MQTT 5.0 support added
 __all__ = [
     "MQTTApp", 
     "subscribe", 

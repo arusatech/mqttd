@@ -11,7 +11,7 @@ long_description = readme_file.read_text() if readme_file.exists() else ""
 
 # Read version from __init__.py
 version_file = Path(__file__).parent / "mqttd" / "__init__.py"
-version = "0.2.0"  # Default version
+version = "0.3.0"  # Default version (will be overridden by reading from __init__.py)
 if version_file.exists():
     for line in version_file.read_text().splitlines():
         if line.startswith("__version__"):
