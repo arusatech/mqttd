@@ -1,27 +1,32 @@
+#!/usr/bin/env python3
 """
-MQTT over QUIC Server Example
+MQTT over QUIC Server - QUIC-Only Mode
 
-This example demonstrates how to run an MQTT server with QUIC/HTTP3 support.
-QUIC provides lower latency connection setup and better performance in
-lossy networks compared to TCP.
+This example demonstrates an MQTT server running ONLY on QUIC/ngtcp2,
+with TCP transport disabled.
 
 Requirements:
-- aioquic: pip install aioquic
+- ngtcp2 C library (for production-grade QUIC)
 - TLS certificates for QUIC (QUIC requires TLS 1.3)
 
 Note: You need to generate TLS certificates. For testing, you can use:
   openssl req -x509 -newkey rsa:2048 -nodes -keyout key.pem -out cert.pem -days 365
 """
 
-import ssl
+import logging
 from mqttd import MQTTApp, MQTTMessage, MQTTClient
 
-# Create MQTT app with both TCP and QUIC enabled (parallel mode)
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+
+# Create MQTT app with QUIC-only mode (TCP disabled)
 app = MQTTApp(
-    port=1883,  # TCP port
-    enable_tcp=True,   # Enable TCP transport (default)
-    enable_quic=True,  # Enable QUIC transport
-    quic_port=1884,   # UDP port for QUIC
+    enable_tcp=False,  # Disable TCP transport
+    enable_quic=True,   # Enable QUIC transport
+    quic_port=1884,    # UDP port for QUIC
     quic_certfile="cert.pem",  # TLS certificate (required for QUIC)
     quic_keyfile="key.pem",    # TLS private key (required for QUIC)
 )
@@ -37,9 +42,8 @@ async def handle_temperature(message: MQTTMessage, client: MQTTClient):
     print(f"Temperature from {client.client_id}: {message.payload_str}")
 
 if __name__ == "__main__":
-    print("Starting MQTT server with both TCP and QUIC...")
-    print("TCP: mqtt://localhost:1883")
+    print("Starting MQTT server in QUIC-only mode...")
     print("QUIC: quic://localhost:1884")
     print("\nNote: QUIC requires TLS certificates (cert.pem and key.pem)")
-    print("For QUIC-only mode, use: enable_tcp=False")
+    print("This server will NOT accept TCP connections.")
     app.run()

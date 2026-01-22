@@ -45,12 +45,16 @@ A high-performance Python package for creating MQTT and MQTTS servers with a Fas
 - **Session Persistence**: Efficient session management with expiry support
 
 ### Transport Protocols
-- **TCP/IP**: Standard MQTT over TCP (port 1883)
+- **TCP/IP**: Standard MQTT over TCP (port 1883) - Default, can be disabled
 - **TLS/TCP**: Secure MQTT over TLS (port 8883)
 - **QUIC/HTTP3**: Optional QUIC transport with multiple implementations:
   - **ngtcp2** (production-grade, best performance) - requires C library
   - **Pure Python** (compatible with no-GIL Python)
   - **aioquic** (fallback for regular Python)
+- **Transport Modes**:
+  - **TCP-only** (default): `enable_tcp=True, enable_quic=False`
+  - **QUIC-only**: `enable_tcp=False, enable_quic=True`
+  - **Both**: `enable_tcp=True, enable_quic=True` (parallel operation)
 
 ## 📦 Installation
 
@@ -198,18 +202,19 @@ if __name__ == "__main__":
     app.run()
 ```
 
-### MQTT over QUIC Server
+### MQTT over QUIC Server (Parallel Mode - TCP + QUIC)
 
 ```python
 from mqttd import MQTTApp, MQTTMessage, MQTTClient
 
-# Create MQTT app with QUIC enabled
+# Create MQTT app with both TCP and QUIC enabled
 app = MQTTApp(
     port=1883,  # TCP port
+    enable_tcp=True,   # Enable TCP transport (default)
     enable_quic=True,  # Enable QUIC transport
-    quic_port=1884,  # UDP port for QUIC
+    quic_port=1884,   # UDP port for QUIC
     quic_certfile="cert.pem",  # TLS certificate (required for QUIC)
-    quic_keyfile="key.pem",  # TLS private key (required for QUIC)
+    quic_keyfile="key.pem",    # TLS private key (required for QUIC)
 )
 
 @app.subscribe("sensors/#")
@@ -223,9 +228,40 @@ async def handle_temperature(message: MQTTMessage, client: MQTTClient):
     print(f"Temperature from {client.client_id}: {message.payload_str}")
 
 if __name__ == "__main__":
-    print("Starting MQTT server with QUIC support...")
+    print("Starting MQTT server with both TCP and QUIC...")
     print("TCP: mqtt://localhost:1883")
     print("QUIC: quic://localhost:1884")
+    app.run()
+```
+
+### MQTT over QUIC Server (QUIC-Only Mode)
+
+```python
+from mqttd import MQTTApp, MQTTMessage, MQTTClient
+
+# Create MQTT app with QUIC-only mode (TCP disabled)
+app = MQTTApp(
+    enable_tcp=False,  # Disable TCP transport
+    enable_quic=True,   # Enable QUIC transport (ngtcp2)
+    quic_port=1884,    # UDP port for QUIC
+    quic_certfile="cert.pem",  # TLS certificate (required for QUIC)
+    quic_keyfile="key.pem",    # TLS private key (required for QUIC)
+)
+
+@app.subscribe("sensors/#")
+async def handle_sensor(topic: str, client: MQTTClient):
+    """Handle sensor messages"""
+    print(f"[{client.client_id}] Subscribed to {topic}")
+
+@app.publish_handler("sensors/temperature")
+async def handle_temperature(message: MQTTMessage, client: MQTTClient):
+    """Handle temperature publishes"""
+    print(f"Temperature from {client.client_id}: {message.payload_str}")
+
+if __name__ == "__main__":
+    print("Starting MQTT server in QUIC-only mode...")
+    print("QUIC: quic://localhost:1884")
+    print("Note: TCP connections are disabled")
     app.run()
 ```
 
@@ -264,8 +300,9 @@ MQTTApp(
     redis_url=None,                    # Redis connection URL (overrides above)
     use_redis=False,                   # Enable Redis pub/sub backend
     
-    # QUIC Configuration (optional)
-    enable_quic=False,                 # Enable QUIC/HTTP3 transport
+    # Transport Configuration
+    enable_tcp=True,                    # Enable TCP transport (default: True)
+    enable_quic=False,                 # Enable QUIC/HTTP3 transport (default: False)
     quic_port=1884,                    # UDP port for QUIC server
     quic_certfile=None,                # Path to TLS certificate for QUIC
     quic_keyfile=None,                 # Path to TLS private key for QUIC

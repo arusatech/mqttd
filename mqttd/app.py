@@ -82,6 +82,7 @@ class MQTTApp:
                  redis_password: Optional[str] = None,
                  redis_url: Optional[str] = None,
                  use_redis: bool = False,
+                 enable_tcp: bool = True,
                  enable_quic: bool = False,
                  quic_port: int = 1884,
                  quic_certfile: Optional[str] = None,
@@ -104,6 +105,7 @@ class MQTTApp:
             redis_password: Redis password (optional)
             redis_url: Redis connection URL (overrides host/port/db/password if provided)
             use_redis: Enable Redis pub/sub backend (default: False = direct routing)
+            enable_tcp: Enable TCP transport (default: True). Set to False for QUIC-only mode.
             enable_quic: Enable QUIC/HTTP3 transport (default: False)
             quic_port: UDP port for QUIC server (default: 1884)
             quic_certfile: Path to TLS certificate for QUIC (required if enable_quic=True)
@@ -126,8 +128,15 @@ class MQTTApp:
         self.redis_password = redis_password
         self.redis_url = redis_url
         
-        # QUIC configuration (optional)
+        # Transport configuration
+        self.enable_tcp = enable_tcp
         self.enable_quic = enable_quic
+        
+        # Validate at least one transport is enabled
+        if not self.enable_tcp and not self.enable_quic:
+            raise ValueError("At least one transport must be enabled (enable_tcp or enable_quic)")
+        
+        # QUIC configuration (optional)
         self.quic_port = quic_port
         self.quic_certfile = quic_certfile
         self.quic_keyfile = quic_keyfile
@@ -1488,11 +1497,11 @@ class MQTTApp:
             self._shutdown_event = asyncio.Event()
             self._shutdown_event.set()
         
-        # Close all client connections gracefully
+        # Close all client connections gracefully (TCP server)
         if self._server:
             self._server.close()
             await self._server.wait_closed()
-            logger.info("Server socket closed")
+            logger.info("TCP server socket closed")
         
         # Wait for connections to close (with timeout)
         start_time = asyncio.get_event_loop().time()
@@ -1531,7 +1540,7 @@ class MQTTApp:
         # Start session cleanup task (periodically clean expired sessions)
         asyncio.create_task(self._session_cleanup_task())
         
-        # Start QUIC server (if enabled) - Pure Python implementation
+        # Start QUIC server (if enabled)
         if self.enable_quic and MQTTQuicServer:
             try:
                 self._quic_server = MQTTQuicServer(
@@ -1550,27 +1559,42 @@ class MQTTApp:
                     logger.info("Note: Using simplified QUIC implementation. For production, install ngtcp2.")
             except Exception as e:
                 logger.error(f"Failed to start QUIC server: {e}")
+                if not self.enable_tcp:
+                    # If TCP is disabled and QUIC fails, we can't continue
+                    raise RuntimeError("QUIC server failed to start and TCP is disabled. Cannot start server.")
                 logger.warning("Continuing with TCP only")
                 self.enable_quic = False
         
-        # Create TCP server
-        self._server = await asyncio.start_server(
-            self._handle_client,
-            self.host,
-            self.port,
-            ssl=self.ssl_context
-        )
+        # Create TCP server (if enabled)
+        self._server = None
+        if self.enable_tcp:
+            self._server = await asyncio.start_server(
+                self._handle_client,
+                self.host,
+                self.port,
+                ssl=self.ssl_context
+            )
+            
+            protocol = "MQTTS" if self.ssl_context else "MQTT"
+            logger.info(f"{protocol} server listening on {self.host}:{self.port}")
         
-        protocol = "MQTTS" if self.ssl_context else "MQTT"
-        logger.info(f"{protocol} server listening on {self.host}:{self.port}")
+        # Log routing mode
         if self.use_redis and self._redis_client:
             logger.info("Redis pub/sub backend: ENABLED (for multi-server scaling)")
         elif not self.use_redis:
             logger.info("Direct routing: ENABLED (lower latency, single server)")
         
+        # Server loop - wait for either TCP or QUIC (or both)
         try:
-            async with self._server:
-                await self._server.serve_forever()
+            if self._server:
+                # If TCP is enabled, serve forever
+                async with self._server:
+                    await self._server.serve_forever()
+            else:
+                # QUIC-only mode: keep the event loop running
+                logger.info("Running in QUIC-only mode. Server is ready.")
+                while self._running:
+                    await asyncio.sleep(1)
         finally:
             # Cleanup QUIC server
             if self._quic_server:
