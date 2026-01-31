@@ -66,7 +66,7 @@ class TestMQTTOverQUICIntegration(unittest.IsolatedAsyncioTestCase):
         self.mqtt_handler_reader = None
         self.mqtt_handler_writer = None
         
-        async def mqtt_handler(reader, writer, connection):
+        async def mqtt_handler(reader, writer):
             self.mqtt_handler_called = True
             self.mqtt_handler_reader = reader
             self.mqtt_handler_writer = writer

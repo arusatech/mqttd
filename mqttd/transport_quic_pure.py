@@ -407,8 +407,9 @@ class QUICServer:
             reader = QUICStreamReader(stream)
             writer = QUICStreamWriter(connection, stream, self)
             
-            # Call MQTT handler (same interface as TCP)
-            await self.mqtt_handler(reader, writer, connection)
+            # Call MQTT handler (same interface as TCP: reader, writer only)
+            # Connection available via writer.get_extra_info('socket')
+            await self.mqtt_handler(reader, writer)
             
         except Exception as e:
             logger.error(f"Error handling MQTT over QUIC: {e}")
