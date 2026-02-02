@@ -35,10 +35,12 @@ logger = logging.getLogger(__name__)
 # Constants from ngtcp2.h
 NGTCP2_MAX_CIDLEN = 20
 NGTCP2_MIN_CIDLEN = 0
+# Minimum UDP payload size; settings->max_tx_udp_payload_size must be >= this (ngtcp2_conn.c assertion)
+NGTCP2_MAX_UDP_PAYLOAD_SIZE = 1200
 NGTCP2_DEFAULT_MAX_RECV_UDP_PAYLOAD_SIZE = 65527
 NGTCP2_DEFAULT_ACK_DELAY_EXPONENT = 3
 NGTCP2_DEFAULT_MAX_ACK_DELAY = 25000000  # 25ms in nanoseconds
-NGTCP2_DEFAULT_ACTIVE_CONNECTION_ID_LIMIT = 8
+NGTCP2_DEFAULT_ACTIVE_CONNECTION_ID_LIMIT = 2  # From ngtcp2.h: default value if omitted
 NGTCP2_DEFAULT_INITIAL_RTT = 333000  # 333ms in nanoseconds
 NGTCP2_MILLISECONDS = 1000000
 NGTCP2_SECONDS = 1000000000
@@ -56,15 +58,30 @@ NGTCP2_SETTINGS_V3 = 3
 # Default to V3 (current version as of ngtcp2 1.21.0)
 NGTCP2_SETTINGS_VERSION = NGTCP2_SETTINGS_V3
 
-# Connection ID structure
+# Callbacks version constants (from ngtcp2_callbacks.h / ngtcp2_callbacks.c)
+# ngtcp2_callbackslen_version() only accepts these; 0 triggers Unreachable abort
+NGTCP2_CALLBACKS_V1 = 1
+NGTCP2_CALLBACKS_VERSION = 2  # current layout (full struct)
+
+# Transport params version (from ngtcp2.h: NGTCP2_TRANSPORT_PARAMS_VERSION = V1)
+NGTCP2_TRANSPORT_PARAMS_V1 = 1
+NGTCP2_TRANSPORT_PARAMS_VERSION = NGTCP2_TRANSPORT_PARAMS_V1
+
+# Packet info version (from ngtcp2.h: NGTCP2_PKT_INFO_V1)
+NGTCP2_PKT_INFO_V1 = 1
+
+# Connection ID structure - FIELD ORDER MUST MATCH C: datalen FIRST, then data
 class ngtcp2_cid(Structure):
     """
-    Connection ID structure
-    Based on curl's usage and ngtcp2 API
+    Connection ID structure - C layout:
+      typedef struct ngtcp2_cid {
+        size_t datalen;              // FIRST
+        uint8_t data[NGTCP2_MAX_CIDLEN];  // SECOND
+      } ngtcp2_cid;
     """
     _fields_ = [
-        ("data", (c_uint8 * NGTCP2_MAX_CIDLEN)),  # Fixed-size array
-        ("datalen", c_size_t),
+        ("datalen", c_size_t),                        # 8 bytes on 64-bit
+        ("data", (c_uint8 * NGTCP2_MAX_CIDLEN)),      # 20 bytes
     ]
     
     def __init__(self, data: Optional[bytes] = None):
@@ -87,6 +104,13 @@ class ngtcp2_cid(Structure):
 
 # Opaque connection pointer
 ngtcp2_conn = c_void_p
+
+
+# Packet info (from ngtcp2.h: ngtcp2_pkt_info, used by read_pkt/write_pkt versioned APIs)
+class ngtcp2_pkt_info(Structure):
+    """Packet metadata (ECN etc.). Used when calling read_pkt_versioned / write_pkt_versioned."""
+    _fields_ = [("ecn", c_uint8)]
+
 
 # Iovec structure for scatter/gather I/O
 class ngtcp2_vec(Structure):
@@ -125,119 +149,163 @@ class ngtcp2_addr(Structure):
     ]
 
 
-# Settings structure
+# Settings structure - field order MUST match ngtcp2.h ngtcp2_settings (conn_new assertion)
+class ngtcp2_rand_ctx(Structure):
+    """Opaque wrapper for ngtcp2_rand_ctx (single pointer)."""
+    _fields_ = [("native_handle", c_void_p)]
+
+
 class ngtcp2_settings(Structure):
     """
-    ngtcp2_settings - Configuration settings for QUIC connection
-    Based on curl's quic_settings() function and ngtcp2 API
+    ngtcp2_settings - Field order must match C struct in ngtcp2.h exactly,
+    else conn_new asserts (e.g. max_tx_udp_payload_size >= NGTCP2_MAX_UDP_PAYLOAD_SIZE).
     """
     _fields_ = [
-        # Congestion control
-        ("cc_algo", c_uint32),  # ngtcp2_cc_algo enum
-        
-        # Timing
-        ("initial_rtt", c_uint64),  # ngtcp2_duration (nanoseconds)
-        ("initial_ts", c_uint64),   # ngtcp2_tstamp (nanoseconds)
-        ("handshake_timeout", c_uint64),  # ngtcp2_duration
-        
-        # ACK settings
-        ("ack_thresh", c_size_t),
-        ("max_ack_delay", c_uint64),  # ngtcp2_duration
-        
-        # UDP payload
+        ("qlog_write", c_void_p),
+        ("cc_algo", c_uint32),
+        ("_pad1", c_uint32),
+        ("initial_ts", c_uint64),
+        ("initial_rtt", c_uint64),
+        ("log_printf", c_void_p),
         ("max_tx_udp_payload_size", c_size_t),
-        ("no_tx_udp_payload_size_shaping", c_uint8),
-        
-        # Path MTU Discovery
-        ("no_pmtud", c_uint8),
-        
-        # Flow control windows (auto-tuning)
-        ("max_window", c_uint64),
-        ("max_stream_window", c_uint64),
-        
-        # Version negotiation
-        ("available_versions", POINTER(c_uint32)),
-        ("available_versionslen", c_size_t),
-        ("preferred_versions", POINTER(c_uint32)),
-        ("preferred_versionslen", c_size_t),
-        ("original_version", c_uint32),
-        
-        # Token (retry/new token frame)
         ("token", POINTER(c_uint8)),
         ("tokenlen", c_size_t),
-        ("token_type", c_uint32),  # ngtcp2_token_type enum
-        
-        # Logging callbacks
-        ("log_printf", c_void_p),  # ngtcp2_printf callback
-        ("qlog_write", c_void_p),  # ngtcp2_qlog_write callback
-        
-        # Random number generator
-        ("rand_ctx", c_void_p),  # ngtcp2_rand_ctx
-        
-        # Glitch rate limiter (DoS protection)
+        ("token_type", c_uint32),
+        ("_pad2", c_uint32),
+        ("rand_ctx", ngtcp2_rand_ctx),
+        ("max_window", c_uint64),
+        ("max_stream_window", c_uint64),
+        ("ack_thresh", c_size_t),
+        ("no_tx_udp_payload_size_shaping", c_uint8),
+        ("_pad3", c_uint8 * 7),
+        ("handshake_timeout", c_uint64),
+        ("preferred_versions", POINTER(c_uint32)),
+        ("preferred_versionslen", c_size_t),
+        ("available_versions", POINTER(c_uint32)),
+        ("available_versionslen", c_size_t),
+        ("original_version", c_uint32),
+        ("no_pmtud", c_uint8),
+        ("_pad5", c_uint8 * 3),
+        ("initial_pkt_num", c_uint32),
+        ("pmtud_probes", POINTER(c_uint16)),
+        ("pmtud_probeslen", c_size_t),
         ("glitch_ratelim_burst", c_uint64),
         ("glitch_ratelim_rate", c_uint64),
     ]
     
     def __init__(self):
         super().__init__()
-        # Initialize to defaults (will be set by ngtcp2_settings_default)
         self.max_window = 0
         self.max_stream_window = 0
 
 
-# Transport parameters structure
-class ngtcp2_transport_params(Structure):
+# Socket address structures for ngtcp2_preferred_addr
+class ngtcp2_in_addr(Structure):
+    """IPv4 address (4 bytes)"""
+    _fields_ = [("s_addr", c_uint32)]
+
+
+class ngtcp2_sockaddr_in(Structure):
+    """IPv4 socket address - matches struct sockaddr_in (16 bytes)"""
+    _fields_ = [
+        ("sin_family", c_uint16),
+        ("sin_port", c_uint16),
+        ("sin_addr", ngtcp2_in_addr),
+        ("sin_zero", c_uint8 * 8),
+    ]
+
+
+class ngtcp2_in6_addr(Structure):
+    """IPv6 address (16 bytes)"""
+    _fields_ = [("in6_addr", c_uint8 * 16)]
+
+
+class ngtcp2_sockaddr_in6(Structure):
+    """IPv6 socket address - matches struct sockaddr_in6 (28 bytes)"""
+    _fields_ = [
+        ("sin6_family", c_uint16),
+        ("sin6_port", c_uint16),
+        ("sin6_flowinfo", c_uint32),
+        ("sin6_addr", ngtcp2_in6_addr),
+        ("sin6_scope_id", c_uint32),
+    ]
+
+
+# Transport parameters structure - field order MUST match ngtcp2.h (conn_new assertion)
+class ngtcp2_preferred_addr(Structure):
     """
-    ngtcp2_transport_params - Transport parameters exchanged during handshake
-    Based on curl's quic_settings() function and ngtcp2 API
+    Preferred address - C layout:
+      typedef struct ngtcp2_preferred_addr {
+        ngtcp2_cid cid;
+        ngtcp2_sockaddr_in ipv4;
+        ngtcp2_sockaddr_in6 ipv6;
+        uint8_t ipv4_present;
+        uint8_t ipv6_present;
+        uint8_t stateless_reset_token[16];
+      } ngtcp2_preferred_addr;
     """
     _fields_ = [
-        # Initial limits
-        ("initial_max_data", c_uint64),
+        ("cid", ngtcp2_cid),
+        ("ipv4", ngtcp2_sockaddr_in),
+        ("ipv6", ngtcp2_sockaddr_in6),
+        ("ipv4_present", c_uint8),
+        ("ipv6_present", c_uint8),
+        ("stateless_reset_token", c_uint8 * 16),
+    ]
+
+
+class ngtcp2_version_info(Structure):
+    """
+    Version info - C layout:
+      typedef struct ngtcp2_version_info {
+        uint32_t chosen_version;
+        const uint8_t *available_versions;
+        size_t available_versionslen;
+      } ngtcp2_version_info;
+    """
+    _fields_ = [
+        ("chosen_version", c_uint32),
+        ("_pad", c_uint32),  # Padding for 64-bit alignment
+        ("available_versions", c_void_p),
+        ("available_versionslen", c_size_t),
+    ]
+
+
+class ngtcp2_transport_params(Structure):
+    """
+    ngtcp2_transport_params - Field order must match C struct in ngtcp2.h exactly,
+    else conn_new asserts (e.g. active_connection_id_limit >= NGTCP2_DEFAULT_ACTIVE_CONNECTION_ID_LIMIT).
+    """
+    _fields_ = [
+        ("preferred_addr", ngtcp2_preferred_addr),
+        ("original_dcid", ngtcp2_cid),
+        ("initial_scid", ngtcp2_cid),
+        ("retry_scid", ngtcp2_cid),
         ("initial_max_stream_data_bidi_local", c_uint64),
         ("initial_max_stream_data_bidi_remote", c_uint64),
         ("initial_max_stream_data_uni", c_uint64),
+        ("initial_max_data", c_uint64),
         ("initial_max_streams_bidi", c_uint64),
         ("initial_max_streams_uni", c_uint64),
-        
-        # Idle timeout
-        ("max_idle_timeout", c_uint64),  # ngtcp2_duration (0 = no timeout)
-        
-        # UDP payload
+        ("max_idle_timeout", c_uint64),
         ("max_udp_payload_size", c_uint64),
-        
-        # ACK delay
-        ("ack_delay_exponent", c_uint64),
-        ("max_ack_delay", c_uint64),  # ngtcp2_duration
-        
-        # Connection ID
         ("active_connection_id_limit", c_uint64),
-        
-        # Connection IDs (for servers)
-        ("original_dcid", ngtcp2_cid),
-        ("original_dcid_present", c_uint8),
-        ("initial_scid", ngtcp2_cid),
-        ("initial_scid_present", c_uint8),
-        ("retry_scid", ngtcp2_cid),
-        ("retry_scid_present", c_uint8),
-        
-        # Stateless reset
-        ("stateless_reset_token", (c_uint8 * 16)),
-        ("stateless_reset_token_present", c_uint8),
-        
-        # Preferred address (server feature)
-        ("preferred_addr", c_void_p),  # ngtcp2_preferred_addr (simplified)
-        ("preferred_addr_present", c_uint8),
-        
-        # Disable active migration
-        ("disable_active_migration", c_uint8),
-        
-        # Datagram frame support (RFC 9221)
+        ("ack_delay_exponent", c_uint64),
+        ("max_ack_delay", c_uint64),
         ("max_datagram_frame_size", c_uint64),
-        
-        # Version information (RFC 9369)
-        ("version_info", c_void_p),  # ngtcp2_version_info (simplified)
+        ("stateless_reset_token_present", c_uint8),
+        ("disable_active_migration", c_uint8),
+        ("original_dcid_present", c_uint8),
+        ("initial_scid_present", c_uint8),
+        ("retry_scid_present", c_uint8),
+        ("preferred_addr_present", c_uint8),
+        # NO padding here - stateless_reset_token follows immediately in C
+        ("stateless_reset_token", c_uint8 * 16),
+        ("grease_quic_bit", c_uint8),
+        # Padding to align version_info to 8-byte boundary (pointer in version_info).
+        # Offset after grease_quic_bit = 269; 269 % 8 = 5 -> need 3 bytes to reach 272.
+        ("_pad_version_info", c_uint8 * 3),
+        ("version_info", ngtcp2_version_info),
         ("version_info_present", c_uint8),
     ]
     
@@ -246,7 +314,11 @@ class ngtcp2_transport_params(Structure):
         # Will be initialized by ngtcp2_transport_params_default
 
 
-# Error code
+# Error codes (from ngtcp2.h) - used for logging and handling
+NGTCP2_ERR_TRANSPORT_PARAM = -225  # General transport parameter error
+NGTCP2_ERR_REQUIRED_TRANSPORT_PARAM = -215
+NGTCP2_ERR_MALFORMED_TRANSPORT_PARAM = -216
+
 # Connection error type enum
 NGTCP2_CCERR_TYPE_TRANSPORT = 0
 NGTCP2_CCERR_TYPE_APPLICATION = 1
@@ -259,43 +331,69 @@ class ngtcp2_ccerr(Structure):
     ]
 
 
-# Connection callbacks structure
+# Connection callbacks structure - MUST match C struct exactly (41 function pointers = 328 bytes)
 class ngtcp2_conn_callbacks(Structure):
     """
-    Connection callbacks structure
-    Based on curl's callback implementations
+    ngtcp2_callbacks - All callback function pointers in exact C order.
+    C struct is 328 bytes (41 x 8 byte pointers on 64-bit).
     """
     _fields_ = [
-        ("client_initial", c_void_p),  # Callback for client initial
-        ("recv_stream_data", c_void_p),  # Callback for receiving stream data
-        ("acked_stream_data_offset", c_void_p),  # Callback for ACKed data
-        ("stream_open", c_void_p),  # Callback for new stream
-        ("stream_close", c_void_p),  # Callback for stream close
-        ("stream_reset", c_void_p),  # Callback for stream reset
-        ("recv_rx_key", c_void_p),  # Callback for receiving RX key
-        ("recv_tx_key", c_void_p),  # Callback for receiving TX key
-        ("handshake_completed", c_void_p),  # Callback for handshake completion
-        ("extend_max_streams_bidi", c_void_p),  # Callback for extending max streams
-        ("extend_max_streams_uni", c_void_p),  # Callback for extending max streams uni
-        ("extend_max_stream_data", c_void_p),  # Callback for extending max stream data
-        ("rand", c_void_p),  # Random number generator callback
-        ("get_new_connection_id", c_void_p),  # Get new connection ID callback
-        ("remove_connection_id", c_void_p),  # Remove connection ID callback
-        ("update_key", c_void_p),  # Update key callback
-        ("path_validation", c_void_p),  # Path validation callback
-        ("select_preferred_addr", c_void_p),  # Select preferred address callback
-        ("stream_reset", c_void_p),  # Stream reset callback (duplicate?)
-        ("extend_max_remote_streams_bidi", c_void_p),  # Extend max remote streams bidi
-        ("extend_max_remote_streams_uni", c_void_p),  # Extend max remote streams uni
+        # Core callbacks (must be set)
+        ("client_initial", c_void_p),
+        ("recv_client_initial", c_void_p),
+        ("recv_crypto_data", c_void_p),
+        ("handshake_completed", c_void_p),
+        ("recv_version_negotiation", c_void_p),
+        ("encrypt", c_void_p),
+        ("decrypt", c_void_p),
+        ("hp_mask", c_void_p),
+        # Stream callbacks
+        ("recv_stream_data", c_void_p),
+        ("acked_stream_data_offset", c_void_p),
+        ("stream_open", c_void_p),
+        ("stream_close", c_void_p),
+        ("recv_stateless_reset", c_void_p),
+        ("recv_retry", c_void_p),
+        ("extend_max_local_streams_bidi", c_void_p),
+        ("extend_max_local_streams_uni", c_void_p),
+        ("rand", c_void_p),
+        ("get_new_connection_id", c_void_p),
+        ("remove_connection_id", c_void_p),
+        ("update_key", c_void_p),
+        ("path_validation", c_void_p),
+        ("select_preferred_addr", c_void_p),
+        ("stream_reset", c_void_p),
+        ("extend_max_remote_streams_bidi", c_void_p),
+        ("extend_max_remote_streams_uni", c_void_p),
+        ("extend_max_stream_data", c_void_p),
+        ("dcid_status", c_void_p),
+        ("handshake_confirmed", c_void_p),
+        ("recv_new_token", c_void_p),
+        ("delete_crypto_aead_ctx", c_void_p),
+        ("delete_crypto_cipher_ctx", c_void_p),
+        # DATAGRAM support (RFC 9221)
+        ("recv_datagram", c_void_p),
+        ("ack_datagram", c_void_p),
+        ("lost_datagram", c_void_p),
+        ("get_path_challenge_data", c_void_p),
+        ("stream_stop_sending", c_void_p),
+        ("version_negotiation", c_void_p),
+        # Key callbacks
+        ("recv_rx_key", c_void_p),
+        ("recv_tx_key", c_void_p),
+        ("tls_early_data_rejected", c_void_p),
+        # Added in later versions
+        ("begin_path_validation", c_void_p),
     ]
 
 
-# Crypto connection reference (for TLS integration)
+# Crypto connection reference (for TLS integration).
+# ABI: get_conn must be first (C code calls it; if user_data were first, C would call conn as a function -> SIGSEGV).
 class ngtcp2_crypto_conn_ref(Structure):
     """Crypto connection reference (for TLS integration)"""
     _fields_ = [
+        ("get_conn", c_void_p),  # Function pointer: ngtcp2_conn* (*get_conn)(ngtcp2_crypto_conn_ref*)
         ("user_data", c_void_p),
-        ("get_conn", c_void_p),  # Function pointer to get connection
     ]
 
 
@@ -477,39 +575,32 @@ if NGTCP2_AVAILABLE and _ngtcp2_lib:
     # Transport params default - try versioned first, then non-versioned
     ngtcp2_transport_params_default = None
     try:
-        # Try versioned function (newer API)
-        ngtcp2_transport_params_default_versioned = lib.ngtcp2_transport_params_default_versioned
-        ngtcp2_transport_params_default_versioned.argtypes = [
+        # C API: void ngtcp2_transport_params_default_versioned(int version, ngtcp2_transport_params *params);
+        _tp_default_versioned = lib.ngtcp2_transport_params_default_versioned
+        _tp_default_versioned.argtypes = [
+            c_int,  # transport_params_version (first in C)
             POINTER(ngtcp2_transport_params),
-            c_int,  # transport_params_version
         ]
-        ngtcp2_transport_params_default_versioned.restype = None
-        
-        # WORKAROUND: Same crash issue as settings_default - use manual initialization
+        _tp_default_versioned.restype = None
+
         def _transport_params_default_wrapper(params_ptr):
-            """Manually initialize transport params to avoid crash"""
-            import ctypes
-            # Zero out the structure
-            ctypes.memset(params_ptr, 0, ctypes.sizeof(ngtcp2_transport_params))
-            # Get the params object
-            params = params_ptr.contents if hasattr(params_ptr, 'contents') else None
-            if params:
-                # Set defaults (minimal required fields)
-                # Most fields can remain zero (default values)
-                pass  # Transport params are typically set explicitly by caller
-        
+            """Call C library to set defaults (max_udp_payload_size, ack_delay_exponent, max_ack_delay, active_connection_id_limit)."""
+            _tp_default_versioned(NGTCP2_TRANSPORT_PARAMS_V1, params_ptr)
+
         ngtcp2_transport_params_default = _transport_params_default_wrapper
-        logger.debug("Using manual transport params initialization (workaround for crash)")
-    except AttributeError:
-        try:
-            # Fall back to non-versioned function
-            ngtcp2_transport_params_default = lib.ngtcp2_transport_params_default
-            ngtcp2_transport_params_default.argtypes = [POINTER(ngtcp2_transport_params)]
-            ngtcp2_transport_params_default.restype = None
-            logger.debug("Using ngtcp2_transport_params_default")
-        except AttributeError:
-            ngtcp2_transport_params_default = None
-            logger.warning("ngtcp2_transport_params_default function not found")
+        logger.debug("Using ngtcp2_transport_params_default_versioned")
+    except (AttributeError, OSError) as e:
+        logger.warning("ngtcp2_transport_params_default_versioned not available: %s, using manual defaults", e)
+        # Fallback: same defaults as C (ngtcp2_transport_params.c)
+        def _transport_params_default_wrapper(params_ptr):
+            ctypes.memset(params_ptr, 0, ctypes.sizeof(ngtcp2_transport_params))
+            p = params_ptr.contents if hasattr(params_ptr, 'contents') else None
+            if p:
+                p.max_udp_payload_size = NGTCP2_DEFAULT_MAX_RECV_UDP_PAYLOAD_SIZE
+                p.active_connection_id_limit = NGTCP2_DEFAULT_ACTIVE_CONNECTION_ID_LIMIT
+                p.ack_delay_exponent = NGTCP2_DEFAULT_ACK_DELAY_EXPONENT
+                p.max_ack_delay = NGTCP2_DEFAULT_MAX_ACK_DELAY
+        ngtcp2_transport_params_default = _transport_params_default_wrapper
     
     # Connection management - Server (try versioned first)
     ngtcp2_conn_server_new = None
@@ -533,12 +624,16 @@ if NGTCP2_AVAILABLE and _ngtcp2_lib:
         ]
         ngtcp2_conn_server_new_versioned.restype = c_int  # 0 on success
         # Create wrapper for easier use
+        # CRITICAL: ngtcp2 versioned APIs only accept explicit version constants.
+        # Passing 0 for any version triggers *len_version(0) -> default -> ngtcp2_unreachable() -> abort.
+        # - callbacks_version=0 -> ngtcp2_callbacks.c:70 ngtcp2_callbackslen_version: Unreachable
+        # - settings_version=0 -> ngtcp2_settings.c:96 ngtcp2_settingslen_version: Unreachable
         def _conn_server_new(pconn, dcid, scid, path, client_version, callbacks, settings, transport_params, mem, user_data):
             return ngtcp2_conn_server_new_versioned(
                 pconn, dcid, scid, path, client_version,
-                0, callbacks,  # callbacks_version = 0 (current)
-                0, settings,  # settings_version = 0 (current)
-                0, transport_params,  # transport_params_version = 0 (current)
+                NGTCP2_CALLBACKS_V1, callbacks,  # 1=valid; 0->Unreachable abort
+                NGTCP2_SETTINGS_VERSION, settings,
+                NGTCP2_TRANSPORT_PARAMS_VERSION, transport_params,
                 mem, user_data
             )
         ngtcp2_conn_server_new = _conn_server_new
@@ -582,82 +677,108 @@ if NGTCP2_AVAILABLE and _ngtcp2_lib:
         logger.warning("ngtcp2_accept function not found")
     
     # Connection management - Read packet (process packet for existing connection)
-    ngtcp2_conn_read_pkt = None
+    ngtcp2_conn_read_pkt_versioned_c = None
+    ngtcp2_conn_read_pkt_fallback_c = None
     try:
-        # Try versioned function (newer API)
-        ngtcp2_conn_read_pkt_versioned = lib.ngtcp2_conn_read_pkt_versioned
-        ngtcp2_conn_read_pkt_versioned.argtypes = [
-            ngtcp2_conn,  # conn
+        # Try versioned function (newer API, 7 params)
+        _v = lib.ngtcp2_conn_read_pkt_versioned
+        _v.argtypes = [
+            POINTER(ngtcp2_conn),  # conn
             POINTER(ngtcp2_path),  # path
+            c_uint32,  # pkt_info_version (version of ngtcp2_pkt_info, use 0)
             c_void_p,  # ngtcp2_pkt_info *pi (can be NULL)
             POINTER(c_uint8),  # pkt (packet data)
             c_size_t,  # pktlen (packet length)
-            c_uint64,  # ts (timestamp in nanoseconds)
+            c_uint64,  # ts (timestamp in nanoseconds, must be monotonic)
         ]
-        ngtcp2_conn_read_pkt_versioned.restype = c_int  # 0 on success
-        ngtcp2_conn_read_pkt = ngtcp2_conn_read_pkt_versioned
+        _v.restype = c_int
+        ngtcp2_conn_read_pkt_versioned_c = _v
         logger.debug("Loaded ngtcp2_conn_read_pkt_versioned")
     except AttributeError:
+        pass
+    if ngtcp2_conn_read_pkt_versioned_c is None:
         try:
-            # Fall back to non-versioned function
-            ngtcp2_conn_read_pkt = lib.ngtcp2_conn_read_pkt
-            ngtcp2_conn_read_pkt.argtypes = [
-                ngtcp2_conn,
+            _f = lib.ngtcp2_conn_read_pkt
+            _f.argtypes = [
+                POINTER(ngtcp2_conn),
                 POINTER(ngtcp2_path),
-                c_void_p,
+                c_void_p,  # pi
                 POINTER(c_uint8),
                 c_size_t,
                 c_uint64,
             ]
-            ngtcp2_conn_read_pkt.restype = c_int
-            logger.debug("Loaded ngtcp2_conn_read_pkt")
+            _f.restype = c_int
+            ngtcp2_conn_read_pkt_fallback_c = _f
+            logger.debug("Loaded ngtcp2_conn_read_pkt (fallback)")
         except AttributeError:
-            ngtcp2_conn_read_pkt = None
-            logger.warning("ngtcp2_conn_read_pkt function not found")
+            pass
+
+    if ngtcp2_conn_read_pkt_versioned_c is not None or ngtcp2_conn_read_pkt_fallback_c is not None:
+        def ngtcp2_conn_read_pkt(conn, path, pkt_info_version, pi, pkt, pktlen, ts):
+            """Unified read: 7 args; calls versioned (7 params) or fallback (6 params)."""
+            if ngtcp2_conn_read_pkt_versioned_c is not None:
+                return ngtcp2_conn_read_pkt_versioned_c(conn, path, pkt_info_version, pi, pkt, pktlen, ts)
+            return ngtcp2_conn_read_pkt_fallback_c(conn, path, pi, pkt, pktlen, ts)
+    else:
+        ngtcp2_conn_read_pkt = None
+        logger.warning("ngtcp2_conn_read_pkt function not found")
     
     # Connection management - Write packets (try versioned first)
-    ngtcp2_conn_write_pkt = None
+    # Versioned API: ngtcp2_conn_write_pkt_versioned(conn, path, pkt_info_version, pi, dest, destlen, pdatalen, ts)
+    # Non-versioned: ngtcp2_conn_write_pkt(conn, path, pi, dest, destlen, ts) -> ngtcp2_ssize (bytes written)
+    _write_pkt_versioned_c = None
+    _write_pkt_fallback_c = None
     try:
-        # Try versioned function (newer API)
-        ngtcp2_conn_write_pkt_versioned = lib.ngtcp2_conn_write_pkt_versioned
-        ngtcp2_conn_write_pkt_versioned.argtypes = [
-            ngtcp2_conn,  # conn
+        _write_pkt_versioned_c = lib.ngtcp2_conn_write_pkt_versioned
+        _write_pkt_versioned_c.argtypes = [
+            POINTER(ngtcp2_conn),  # conn
             POINTER(ngtcp2_path),  # path
-            POINTER(c_uint8),  # out (output buffer)
-            c_size_t,  # outlen (output buffer size)
-            POINTER(c_size_t),  # pktlen (packet length out)
+            c_uint32,  # pkt_info_version (NGTCP2_PKT_INFO_V1)
+            c_void_p,  # ngtcp2_pkt_info *pi (can be NULL)
+            POINTER(c_uint8),  # dest (output buffer)
+            c_size_t,  # destlen (buffer size)
+            POINTER(c_size_t),  # pdatalen (bytes written out)
             c_uint64,  # ts (timestamp)
-            c_void_p,  # user_data
-            c_void_p,  # send_pkt callback (function pointer)
         ]
-        ngtcp2_conn_write_pkt_versioned.restype = c_int  # 0 on success
-        ngtcp2_conn_write_pkt = ngtcp2_conn_write_pkt_versioned
+        _write_pkt_versioned_c.restype = c_ssize_t  # ngtcp2_ssize: bytes written or error
         logger.debug("Using ngtcp2_conn_write_pkt_versioned")
     except AttributeError:
+        pass
+    if _write_pkt_versioned_c is None:
         try:
-            # Fall back to non-versioned function
-            ngtcp2_conn_write_pkt = lib.ngtcp2_conn_write_pkt
-            ngtcp2_conn_write_pkt.argtypes = [
-                ngtcp2_conn,
+            _write_pkt_fallback_c = lib.ngtcp2_conn_write_pkt
+            _write_pkt_fallback_c.argtypes = [
+                POINTER(ngtcp2_conn),
                 POINTER(ngtcp2_path),
+                c_void_p,  # ngtcp2_pkt_info *pi (can be NULL)
                 POINTER(c_uint8),
                 c_size_t,
-                POINTER(c_size_t),
-                c_uint64,
-                c_void_p,
-                c_void_p,
+                c_uint64,  # ts
             ]
-            ngtcp2_conn_write_pkt.restype = c_int
-            logger.debug("Using ngtcp2_conn_write_pkt")
+            _write_pkt_fallback_c.restype = c_ssize_t  # bytes written or error
+            logger.debug("Using ngtcp2_conn_write_pkt (fallback)")
         except AttributeError:
-            ngtcp2_conn_write_pkt = None
-            logger.warning("ngtcp2_conn_write_pkt function not found")
+            pass
+
+    def ngtcp2_conn_write_pkt(conn, path, dest, destlen, pdatalen, ts):
+        """Unified write: (conn, path, dest, destlen, pdatalen, ts). pdatalen is c_size_t byref; ts must be monotonic."""
+        if _write_pkt_versioned_c is not None:
+            return _write_pkt_versioned_c(conn, path, NGTCP2_PKT_INFO_V1, None, dest, destlen, pdatalen, ts)
+        if _write_pkt_fallback_c is not None:
+            r = _write_pkt_fallback_c(conn, path, None, dest, destlen, ts)
+            if r >= 0 and pdatalen is not None:
+                try:
+                    pdatalen.contents = r
+                except Exception:
+                    pass
+            return r
+        return -1
     
     # Connection management - Handle expiry
     try:
         ngtcp2_conn_handle_expiry = lib.ngtcp2_conn_handle_expiry
         ngtcp2_conn_handle_expiry.argtypes = [
-            ngtcp2_conn,  # conn
+            POINTER(ngtcp2_conn),  # conn
             POINTER(ngtcp2_path),  # path
             c_uint64,  # ts (timestamp)
             c_void_p,  # user_data
@@ -675,7 +796,7 @@ if NGTCP2_AVAILABLE and _ngtcp2_lib:
         # Try versioned function first
         ngtcp2_conn_write_connection_close_versioned = lib.ngtcp2_conn_write_connection_close_versioned
         ngtcp2_conn_write_connection_close_versioned.argtypes = [
-            ngtcp2_conn,  # conn
+            POINTER(ngtcp2_conn),  # conn
             POINTER(ngtcp2_path),  # path (can be NULL)
             c_void_p,  # pkt_info (can be NULL)
             POINTER(c_uint8),  # out (output buffer)
@@ -718,7 +839,7 @@ if NGTCP2_AVAILABLE and _ngtcp2_lib:
             # Try non-versioned function
             ngtcp2_conn_write_connection_close = lib.ngtcp2_conn_write_connection_close
             ngtcp2_conn_write_connection_close.argtypes = [
-                ngtcp2_conn,
+                POINTER(ngtcp2_conn),
                 POINTER(ngtcp2_path),
                 c_void_p,
                 POINTER(c_uint8),
@@ -827,7 +948,7 @@ if NGTCP2_AVAILABLE and _ngtcp2_lib:
     try:
         ngtcp2_strm_shutdown = lib.ngtcp2_conn_shutdown_stream
         ngtcp2_strm_shutdown.argtypes = [
-            ngtcp2_conn,  # conn
+            POINTER(ngtcp2_conn),  # conn
             c_uint32,  # flags (NGTCP2_SHUTDOWN_STREAM_FLAG_*)
             c_int64,  # stream_id
             c_uint64,  # error_code (application error code)
@@ -917,21 +1038,28 @@ if NGTCP2_AVAILABLE and _ngtcp2_lib:
     # Connection expiry and state
     try:
         ngtcp2_conn_get_expiry = lib.ngtcp2_conn_get_expiry
-        ngtcp2_conn_get_expiry.argtypes = [ngtcp2_conn]
+        ngtcp2_conn_get_expiry.argtypes = [POINTER(ngtcp2_conn)]
         ngtcp2_conn_get_expiry.restype = c_uint64  # ngtcp2_tstamp
     except AttributeError:
         ngtcp2_conn_get_expiry = None
     
     try:
         ngtcp2_conn_get_handshake_completed = lib.ngtcp2_conn_get_handshake_completed
-        ngtcp2_conn_get_handshake_completed.argtypes = [ngtcp2_conn]
+        ngtcp2_conn_get_handshake_completed.argtypes = [POINTER(ngtcp2_conn)]
         ngtcp2_conn_get_handshake_completed.restype = c_int  # boolean
     except AttributeError:
         ngtcp2_conn_get_handshake_completed = None
     
     try:
+        ngtcp2_conn_set_tls_native_handle = lib.ngtcp2_conn_set_tls_native_handle
+        ngtcp2_conn_set_tls_native_handle.argtypes = [POINTER(ngtcp2_conn), c_void_p]  # conn*, tls_native_handle (SSL*)
+        ngtcp2_conn_set_tls_native_handle.restype = None
+    except AttributeError:
+        ngtcp2_conn_set_tls_native_handle = None
+    
+    try:
         ngtcp2_conn_del = lib.ngtcp2_conn_del
-        ngtcp2_conn_del.argtypes = [ngtcp2_conn, c_void_p]  # mem (can be NULL)
+        ngtcp2_conn_del.argtypes = [POINTER(ngtcp2_conn), c_void_p]  # conn*, mem (can be NULL)
         ngtcp2_conn_del.restype = None
     except AttributeError:
         ngtcp2_conn_del = None
@@ -960,6 +1088,7 @@ else:
     ngtcp2_conn_set_stream_user_data = None
     ngtcp2_conn_get_expiry = None
     ngtcp2_conn_get_handshake_completed = None
+    ngtcp2_conn_set_tls_native_handle = None
     ngtcp2_conn_del = None
 
 

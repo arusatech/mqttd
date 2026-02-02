@@ -19,7 +19,7 @@ import os
 import secrets
 from ctypes import (
     POINTER, byref, cast, c_void_p, c_int, c_int64, c_uint8, c_uint32, c_uint64,
-    c_size_t, c_ssize_t, Structure, Array, create_string_buffer
+    c_size_t, c_ssize_t, Structure, Array, create_string_buffer, CFUNCTYPE
 )
 from typing import Optional, Dict, Callable, Any, Tuple, List
 from collections import defaultdict
@@ -30,8 +30,8 @@ try:
     from .ngtcp2_bindings import (
         NGTCP2_AVAILABLE, get_ngtcp2_lib,
         ngtcp2_cid, ngtcp2_conn, ngtcp2_settings, ngtcp2_transport_params,
-        ngtcp2_path, ngtcp2_path_storage, ngtcp2_addr, ngtcp2_conn_callbacks,
-        ngtcp2_crypto_conn_ref, SendPacketFunc, RecvPacketFunc,
+        ngtcp2_path, ngtcp2_path_storage, ngtcp2_addr, ngtcp2_sockaddr_in,
+        ngtcp2_conn_callbacks, ngtcp2_crypto_conn_ref, SendPacketFunc, RecvPacketFunc,
         ngtcp2_settings_default, ngtcp2_transport_params_default,
         ngtcp2_conn_server_new, ngtcp2_accept, ngtcp2_conn_read_pkt,
         ngtcp2_conn_write_pkt, ngtcp2_conn_handle_expiry, ngtcp2_conn_close,
@@ -41,14 +41,16 @@ try:
         ngtcp2_conn_get_stream_user_data,
         ngtcp2_strm_recv, ngtcp2_strm_write,
         NGTCP2_MILLISECONDS, NGTCP2_SECONDS, NGTCP2_MICROSECONDS,
-        NGTCP2_MAX_CIDLEN, NGTCP2_PROTO_VER_V1,
+        NGTCP2_MAX_CIDLEN, NGTCP2_PROTO_VER_V1, NGTCP2_MAX_UDP_PAYLOAD_SIZE,
+        NGTCP2_DEFAULT_MAX_RECV_UDP_PAYLOAD_SIZE,
+        NGTCP2_DEFAULT_ACK_DELAY_EXPONENT, NGTCP2_DEFAULT_MAX_ACK_DELAY,
     )
 except ImportError:
     from mqttd.ngtcp2_bindings import (
         NGTCP2_AVAILABLE, get_ngtcp2_lib,
         ngtcp2_cid, ngtcp2_conn, ngtcp2_settings, ngtcp2_transport_params,
-        ngtcp2_path, ngtcp2_path_storage, ngtcp2_addr, ngtcp2_conn_callbacks,
-        ngtcp2_crypto_conn_ref, SendPacketFunc, RecvPacketFunc,
+        ngtcp2_path, ngtcp2_path_storage, ngtcp2_addr, ngtcp2_sockaddr_in,
+        ngtcp2_conn_callbacks, ngtcp2_crypto_conn_ref, SendPacketFunc, RecvPacketFunc,
         ngtcp2_settings_default, ngtcp2_transport_params_default,
         ngtcp2_conn_server_new, ngtcp2_accept, ngtcp2_conn_read_pkt,
         ngtcp2_conn_write_pkt, ngtcp2_conn_handle_expiry, ngtcp2_conn_close,
@@ -58,7 +60,9 @@ except ImportError:
         ngtcp2_conn_get_stream_user_data,
         ngtcp2_strm_recv, ngtcp2_strm_write,
         NGTCP2_MILLISECONDS, NGTCP2_SECONDS, NGTCP2_MICROSECONDS,
-        NGTCP2_MAX_CIDLEN, NGTCP2_PROTO_VER_V1,
+        NGTCP2_MAX_CIDLEN, NGTCP2_PROTO_VER_V1, NGTCP2_MAX_UDP_PAYLOAD_SIZE,
+        NGTCP2_DEFAULT_MAX_RECV_UDP_PAYLOAD_SIZE,
+        NGTCP2_DEFAULT_ACK_DELAY_EXPONENT, NGTCP2_DEFAULT_MAX_ACK_DELAY,
     )
 
 # Import TLS bindings
@@ -66,12 +70,22 @@ try:
     from .ngtcp2_tls_bindings import (
         init_tls_backend, verify_tls_bindings,
         USE_OPENSSL, USE_WOLFSSL,
+        _ensure_callbacks_bound, _ensure_openssl_bound,
+        create_server_tls_ctx, create_server_tls_session, free_tls_session,
+        SSL_set_app_data,
     )
+    from . import ngtcp2_tls_bindings as _tls_mod
+    from .ngtcp2_bindings import ngtcp2_conn_set_tls_native_handle
 except ImportError:
     from mqttd.ngtcp2_tls_bindings import (
         init_tls_backend, verify_tls_bindings,
         USE_OPENSSL, USE_WOLFSSL,
+        _ensure_callbacks_bound, _ensure_openssl_bound,
+        create_server_tls_ctx, create_server_tls_session, free_tls_session,
+        SSL_set_app_data,
     )
+    from mqttd import ngtcp2_tls_bindings as _tls_mod
+    from mqttd.ngtcp2_bindings import ngtcp2_conn_set_tls_native_handle
 
 logger = logging.getLogger(__name__)
 
@@ -80,6 +94,18 @@ MAX_PKT_BURST = 10
 MAX_UDP_PAYLOAD_SIZE = 1452
 QUIC_MAX_STREAMS = 256 * 1024
 HANDSHAKE_TIMEOUT = 10 * NGTCP2_SECONDS  # 10 seconds
+
+# ngtcp2 read_pkt error code -> human-readable message (from ngtcp2.h)
+_NGTCP2_READ_PKT_ERRORS = {
+    -225: "NGTCP2_ERR_TRANSPORT_PARAM (transport parameter error)",
+    -216: "NGTCP2_ERR_MALFORMED_TRANSPORT_PARAM (malformed transport parameter)",
+    -215: "NGTCP2_ERR_REQUIRED_TRANSPORT_PARAM (required transport parameter missing)",
+}
+
+
+def _ngtcp2_read_pkt_error_message(result: int) -> str:
+    """Return a human-readable message for ngtcp2_conn_read_pkt error code."""
+    return _NGTCP2_READ_PKT_ERRORS.get(result, str(result))
 
 
 class NGTCP2Stream:
@@ -125,14 +151,14 @@ class NGTCP2Stream:
     def close(self):
         """Close the stream"""
         self.state = "closed"
-        # Check if connection has conn attribute (may be Mock in tests)
-        if hasattr(self.connection, 'conn') and self.connection.conn:
+        # Check if connection has conn pointer (may be Mock in tests)
+        if hasattr(self.connection, '_conn_ptr') and self.connection._conn_ptr:
             # Shutdown stream in ngtcp2
             try:
                 # Use ngtcp2_strm_shutdown (which wraps ngtcp2_conn_shutdown_stream)
                 if ngtcp2_strm_shutdown:
                     ngtcp2_strm_shutdown(
-                        self.connection.conn,
+                        self.connection._conn_ptr,
                         0,  # flags (NGTCP2_SHUTDOWN_STREAM_FLAG_NONE)
                         self.stream_id,
                         0,  # error_code (NO_ERROR)
@@ -202,7 +228,7 @@ class NGTCP2StreamWriter:
         # For now, we'll trigger a send_packets call
         # Check if connection has conn attribute (may be Mock in tests)
         if hasattr(self.connection, 'conn') and self.connection.conn:
-            timestamp = int(time.time() * NGTCP2_SECONDS)
+            timestamp = time.monotonic_ns()
             self.connection.send_packets(timestamp)
     
     async def drain(self):
@@ -250,6 +276,7 @@ class NGTCP2Connection:
         
         # ngtcp2 connection pointer
         self.conn: Optional[ngtcp2_conn] = None
+        self._conn_ptr = None  # Keep the ctypes pointer reference
         
         # Connection state
         self.state = "initial"  # initial, handshake, connected, closed
@@ -264,8 +291,11 @@ class NGTCP2Connection:
         self.last_packet_at = time.time()
         self.last_io_at = time.time()
         
-        # Path storage
+        # Path storage (must be valid for ngtcp2_conn_server_new - path must not be NULL)
         self.path_storage = ngtcp2_path_storage()
+        # Keep sockaddr buffers alive so path_storage.ps pointers stay valid
+        self._local_sockaddr = ngtcp2_sockaddr_in()
+        self._remote_sockaddr = ngtcp2_sockaddr_in()
         
         # Settings and transport params
         self.settings = ngtcp2_settings()
@@ -276,6 +306,12 @@ class NGTCP2Connection:
         
         # TLS context (will be set up later)
         self.tls_ctx: Optional[c_void_p] = None
+        # TLS session for this connection (OpenSSL 3.x implements TLS 1.3)
+        self.tls_session: Optional[c_void_p] = None
+        # Crypto connection reference (for ngtcp2_crypto callbacks to find conn)
+        self.crypto_conn_ref: Optional[ngtcp2_crypto_conn_ref] = None
+        # Keep reference to get_conn callback to prevent GC
+        self._get_conn_callback = None
         
         # User data for callbacks
         self.user_data_ptr = c_void_p(id(self))
@@ -299,54 +335,59 @@ class NGTCP2Connection:
                 self.server.tls_initialized = True
             
             # Initialize settings with defaults
-            # WORKAROUND: ngtcp2_settings_default crashes in some configurations
-            # Manually initialize settings instead to avoid crash
-            # This is safe because we're setting the same defaults that ngtcp2 would set
-            try:
-                if ngtcp2_settings_default:
-                    ngtcp2_settings_default(byref(self.settings))
-            except (SystemError, OSError, RuntimeError, AttributeError) as e:
-                # If settings_default crashes or is None, manually initialize
-                logger.debug(f"ngtcp2_settings_default not available, using manual initialization: {e}")
-                # Manually set defaults (minimal required fields)
-                # Zero out the structure first
-                import ctypes
-                ctypes.memset(ctypes.byref(self.settings), 0, ctypes.sizeof(self.settings))
-                # Set basic required fields (matching ngtcp2 defaults)
-                self.settings.cc_algo = 0  # NGTCP2_CC_ALGO_CUBIC
-                self.settings.initial_rtt = 333000  # 333ms (NGTCP2_DEFAULT_INITIAL_RTT)
-                self.settings.ack_thresh = 2
-                self.settings.max_tx_udp_payload_size = 1452  # 1500 - 48 (UDP header)
-                self.settings.handshake_timeout = HANDSHAKE_TIMEOUT
-                self.settings.max_window = 100 * 1024 * 1024  # 100 MB
-                self.settings.max_stream_window = 10 * 1024 * 1024  # 10 MB
-            
-            # Set custom settings
-            self.settings.initial_ts = int(time.time() * NGTCP2_SECONDS)
+            # WORKAROUND: Never call C ngtcp2_settings_default - it can trigger
+            # ngtcp2_settingslen_version(version) with invalid version and abort.
+            # Always use manual initialization (same defaults as ngtcp2).
+            self.settings.cc_algo = 0  # NGTCP2_CC_ALGO_CUBIC
+            self.settings.initial_rtt = 333000  # 333ms (NGTCP2_DEFAULT_INITIAL_RTT)
+            self.settings.ack_thresh = 2
+            self.settings.max_tx_udp_payload_size = max(1452, NGTCP2_MAX_UDP_PAYLOAD_SIZE)  # ngtcp2_conn.c assertion
             self.settings.handshake_timeout = HANDSHAKE_TIMEOUT
             self.settings.max_window = 100 * 1024 * 1024  # 100 MB
             self.settings.max_stream_window = 10 * 1024 * 1024  # 10 MB
             
-            # Initialize transport params with defaults
+            # Set custom settings: ngtcp2 requires monotonic timestamps (nanoseconds); use monotonic_ns()
+            self.settings.initial_ts = time.monotonic_ns()
+            self._last_ts = self.settings.initial_ts  # ngtcp2 requires conn->log.last_ts <= ts
+            self.settings.handshake_timeout = HANDSHAKE_TIMEOUT
+            self.settings.max_window = 100 * 1024 * 1024  # 100 MB
+            self.settings.max_stream_window = 10 * 1024 * 1024  # 10 MB
+            
+            # Initialize transport params with C library defaults (max_udp_payload_size, ack_delay_exponent, max_ack_delay, active_connection_id_limit)
             if ngtcp2_transport_params_default:
                 ngtcp2_transport_params_default(byref(self.transport_params))
             
-            # Set transport params
+            # Set transport params (overrides)
             self.transport_params.initial_max_data = self.settings.max_window
             self.transport_params.initial_max_stream_data_bidi_local = 32 * 1024
             self.transport_params.initial_max_stream_data_bidi_remote = 32 * 1024
             self.transport_params.initial_max_stream_data_uni = self.settings.max_window
             self.transport_params.initial_max_streams_bidi = QUIC_MAX_STREAMS
             self.transport_params.initial_max_streams_uni = QUIC_MAX_STREAMS
-            self.transport_params.max_idle_timeout = 0  # No idle timeout
+            self.transport_params.max_idle_timeout = 0  # No idle timeout (valid; must not be UINT64_MAX)
+            # active_connection_id_limit in [2, 7]; keep 2 from default
+            self.transport_params.active_connection_id_limit = 2
+            # Ensure ngtcp2-valid defaults for params checked during handshake (in case default init was fallback)
+            self.transport_params.max_udp_payload_size = NGTCP2_DEFAULT_MAX_RECV_UDP_PAYLOAD_SIZE
+            self.transport_params.ack_delay_exponent = NGTCP2_DEFAULT_ACK_DELAY_EXPONENT
+            self.transport_params.max_ack_delay = NGTCP2_DEFAULT_MAX_ACK_DELAY
             
             # Set original_dcid for server (from client's first Initial packet)
             dcid_cid = ngtcp2_cid(self.dcid)
             self.transport_params.original_dcid = dcid_cid
             self.transport_params.original_dcid_present = 1
+            # Server must not send initial_scid/retry_scid in normal connection
+            self.transport_params.initial_scid_present = 0
+            self.transport_params.retry_scid_present = 0
+            # Do not send version_information unless doing version negotiation
+            self.transport_params.version_info_present = 0
+            self.transport_params.version_info.chosen_version = 0
+            self.transport_params.version_info.available_versions = None
+            self.transport_params.version_info.available_versionslen = 0
             
-            # Initialize path storage
-            # TODO: Set up proper path from remote_addr
+            # Initialize path: ngtcp2_conn_server_new requires a non-NULL path
+            # (crash in ngtcp2_addr_copy if path is NULL)
+            self._fill_path_storage()
             
             # Set up callbacks
             self._setup_callbacks()
@@ -361,7 +402,7 @@ class NGTCP2Connection:
                 byref(conn_ptr),  # conn (out)
                 byref(dcid_cid),  # dcid
                 byref(scid_cid),  # scid
-                byref(self.path_storage.ps) if self.path else None,  # path
+                byref(self.path_storage.ps),  # path (must be non-NULL)
                 NGTCP2_PROTO_VER_V1,  # client_chosen_version
                 byref(self.callbacks),  # callbacks
                 byref(self.settings),  # settings
@@ -374,10 +415,62 @@ class NGTCP2Connection:
                 logger.error(f"Failed to create ngtcp2 connection: {result}")
                 return False
             
-            self.conn = conn_ptr.contents if conn_ptr else None
-            if not self.conn:
+            if not conn_ptr:
                 logger.error("ngtcp2_conn_server_new returned NULL")
                 return False
+            
+            # Keep both the pointer and its contents
+            self._conn_ptr = conn_ptr  # Keep pointer reference
+            self.conn = conn_ptr.contents
+            
+            # Get the actual pointer value (address) for crypto callbacks
+            conn_ptr_value = ctypes.cast(conn_ptr, c_void_p).value
+            
+            # Create and associate TLS session with the connection
+            self.tls_session = create_server_tls_session()
+            if not self.tls_session:
+                logger.error("Failed to create TLS session for connection")
+                return False
+            
+            # Set up crypto conn_ref so ngtcp2_crypto callbacks can find the conn
+            # The get_conn callback returns the ngtcp2_conn from the conn_ref
+            
+            # Create get_conn callback: ngtcp2_conn* get_conn(ngtcp2_crypto_conn_ref* ref)
+            @CFUNCTYPE(c_void_p, c_void_p)
+            def get_conn_callback(ref_ptr):
+                # ref_ptr points to our crypto_conn_ref, user_data contains conn ptr
+                if ref_ptr:
+                    ref = ctypes.cast(ref_ptr, POINTER(ngtcp2_crypto_conn_ref)).contents
+                    return ref.user_data
+                return None
+            
+            # Keep reference to prevent garbage collection
+            self._get_conn_callback = get_conn_callback
+            
+            # Create the conn_ref structure
+            self.crypto_conn_ref = ngtcp2_crypto_conn_ref()
+            self.crypto_conn_ref.user_data = conn_ptr_value
+            self.crypto_conn_ref.get_conn = ctypes.cast(get_conn_callback, c_void_p).value
+            
+            # Store conn_ref pointer in SSL's app data (crypto_ossl_ctx holds SSL; get it for set_app_data)
+            _ensure_openssl_bound()
+            if _tls_mod.SSL_set_app_data:
+                conn_ref_ptr = ctypes.cast(ctypes.pointer(self.crypto_conn_ref), c_void_p).value
+                ssl_for_app_data = self.tls_session
+                if getattr(_tls_mod, 'ngtcp2_crypto_ossl_ctx_get_ssl', None):
+                    ssl_for_app_data = _tls_mod.ngtcp2_crypto_ossl_ctx_get_ssl(self.tls_session)
+                if ssl_for_app_data:
+                    _tls_mod.SSL_set_app_data(ssl_for_app_data, conn_ref_ptr)
+                    logger.debug("Set TLS session app data to crypto_conn_ref")
+            else:
+                logger.warning("SSL_set_app_data not available - crypto callbacks may fail")
+            
+            # Associate TLS native handle with ngtcp2 connection (crypto_ossl_ctx*, not raw SSL*)
+            if ngtcp2_conn_set_tls_native_handle:
+                ngtcp2_conn_set_tls_native_handle(self._conn_ptr, self.tls_session)
+                logger.debug("Associated TLS session with ngtcp2 connection")
+            else:
+                logger.warning("ngtcp2_conn_set_tls_native_handle not available")
             
             self.state = "handshake"
             logger.info(f"Created ngtcp2 connection: dcid={self.dcid.hex()[:8]}, scid={self.scid.hex()[:8]}")
@@ -387,12 +480,99 @@ class NGTCP2Connection:
             logger.error(f"Error initializing ngtcp2 connection: {e}", exc_info=True)
             return False
     
+    def _fill_path_storage(self):
+        """Fill path_storage with local (server) and remote (client) addresses.
+        ngtcp2_conn_server_new requires a non-NULL path or it crashes in ngtcp2_addr_copy.
+        """
+        try:
+            # IPv4 sockaddr_in: family=2, port=network order, addr=network order, zero padding
+            def fill_sockaddr_in(sa: ngtcp2_sockaddr_in, host: str, port: int) -> None:
+                sa.sin_family = socket.AF_INET
+                sa.sin_port = socket.htons(port)
+                # sin_addr.s_addr is uint32 in network byte order
+                addr_bytes = socket.inet_pton(socket.AF_INET, host)
+                sa.sin_addr.s_addr = struct.unpack('!I', addr_bytes)[0]
+                # sin_zero already zeroed by ctypes
+            
+            fill_sockaddr_in(self._local_sockaddr, self.server.host, self.server.port)
+            fill_sockaddr_in(self._remote_sockaddr, self.remote_addr[0], self.remote_addr[1])
+            
+            addrlen = ctypes.sizeof(ngtcp2_sockaddr_in)
+            # path expects void* (address); keep references so buffers stay alive
+            self.path_storage.ps.local_addr = ctypes.cast(
+                ctypes.pointer(self._local_sockaddr), c_void_p
+            ).value
+            self.path_storage.ps.local_addrlen = addrlen
+            self.path_storage.ps.remote_addr = ctypes.cast(
+                ctypes.pointer(self._remote_sockaddr), c_void_p
+            ).value
+            self.path_storage.ps.remote_addrlen = addrlen
+        except Exception as e:
+            logger.warning(f"Could not fill path storage: {e} - using zeroed path")
+    
     def _setup_callbacks(self):
-        """Set up ngtcp2 connection callbacks"""
-        # Note: This is a simplified version. Full implementation would
-        # set all callback function pointers in the callbacks structure.
-        # For now, we'll handle callbacks via Python wrapper functions.
-        pass
+        """Set up ngtcp2 connection callbacks using crypto library helpers"""
+        # Ensure crypto callbacks are bound (handles circular import issues)
+        _ensure_callbacks_bound()
+        
+        # Use ngtcp2_crypto callback implementations for crypto operations
+        # These are provided by libngtcp2_crypto_ossl and handle TLS integration
+        
+        # Server-required callbacks from ngtcp2_crypto
+        if _tls_mod.ngtcp2_crypto_recv_client_initial_cb:
+            self.callbacks.recv_client_initial = _tls_mod.ngtcp2_crypto_recv_client_initial_cb
+        if _tls_mod.ngtcp2_crypto_recv_crypto_data_cb:
+            self.callbacks.recv_crypto_data = _tls_mod.ngtcp2_crypto_recv_crypto_data_cb
+        if _tls_mod.ngtcp2_crypto_encrypt_cb:
+            self.callbacks.encrypt = _tls_mod.ngtcp2_crypto_encrypt_cb
+        if _tls_mod.ngtcp2_crypto_decrypt_cb:
+            self.callbacks.decrypt = _tls_mod.ngtcp2_crypto_decrypt_cb
+        if _tls_mod.ngtcp2_crypto_hp_mask_cb:
+            self.callbacks.hp_mask = _tls_mod.ngtcp2_crypto_hp_mask_cb
+        if _tls_mod.ngtcp2_crypto_update_key_cb:
+            self.callbacks.update_key = _tls_mod.ngtcp2_crypto_update_key_cb
+        if _tls_mod.ngtcp2_crypto_delete_crypto_aead_ctx_cb:
+            self.callbacks.delete_crypto_aead_ctx = _tls_mod.ngtcp2_crypto_delete_crypto_aead_ctx_cb
+        if _tls_mod.ngtcp2_crypto_delete_crypto_cipher_ctx_cb:
+            self.callbacks.delete_crypto_cipher_ctx = _tls_mod.ngtcp2_crypto_delete_crypto_cipher_ctx_cb
+        if _tls_mod.ngtcp2_crypto_get_path_challenge_data_cb:
+            self.callbacks.get_path_challenge_data = _tls_mod.ngtcp2_crypto_get_path_challenge_data_cb
+        
+        # rand callback - use Python's os.urandom via ctypes wrapper
+        # Create a CFUNCTYPE for the rand callback signature:
+        # void rand(uint8_t *dest, size_t destlen, const ngtcp2_rand_ctx *rand_ctx)
+        @CFUNCTYPE(None, POINTER(c_uint8), c_size_t, c_void_p)
+        def rand_callback(dest, destlen, rand_ctx):
+            import os
+            random_bytes = os.urandom(destlen)
+            for i in range(destlen):
+                dest[i] = random_bytes[i]
+        
+        # Keep reference to prevent garbage collection
+        self._rand_callback = rand_callback
+        self.callbacks.rand = ctypes.cast(rand_callback, c_void_p).value
+        
+        # get_new_connection_id callback
+        # int get_new_connection_id(ngtcp2_conn *conn, ngtcp2_cid *cid, uint8_t *token, size_t cidlen, void *user_data)
+        @CFUNCTYPE(c_int, c_void_p, POINTER(ngtcp2_cid), POINTER(c_uint8), c_size_t, c_void_p)
+        def get_new_connection_id_callback(conn, cid, token, cidlen, user_data):
+            import os
+            # Generate random connection ID
+            random_cid = os.urandom(cidlen)
+            cid.contents.datalen = cidlen
+            for i in range(cidlen):
+                cid.contents.data[i] = random_cid[i]
+            # Generate random stateless reset token (16 bytes)
+            random_token = os.urandom(16)
+            for i in range(16):
+                token[i] = random_token[i]
+            return 0  # Success
+        
+        # Keep reference to prevent garbage collection
+        self._get_new_connection_id_callback = get_new_connection_id_callback
+        self.callbacks.get_new_connection_id = ctypes.cast(get_new_connection_id_callback, c_void_p).value
+        
+        logger.debug("ngtcp2 callbacks configured")
     
     def recv_packet(self, data: bytes, timestamp: Optional[int] = None) -> bool:
         """
@@ -405,25 +585,44 @@ class NGTCP2Connection:
         
         try:
             if timestamp is None:
-                timestamp = int(time.time() * NGTCP2_SECONDS)
-            
+                timestamp = time.monotonic_ns()
+            # ngtcp2 requires ts >= conn->log.last_ts (monotonic); ensure >= initial_ts and last used
+            timestamp = max(timestamp, self.settings.initial_ts)
+            timestamp = max(timestamp, getattr(self, '_last_ts', 0))
+            self._last_ts = timestamp
+
             # Convert data to ctypes
             pkt_data = (c_uint8 * len(data)).from_buffer_copy(data)
             
-            # Read packet into connection
+            # Read packet into connection (versioned API: 7 args; path must be non-NULL)
             result = ngtcp2_conn_read_pkt(
-                self.conn,
-                byref(self.path_storage.ps) if self.path else None,
+                self._conn_ptr,
+                byref(self.path_storage.ps),
+                0,  # pkt_info_version (0 = default)
                 None,  # pkt_info (can be NULL)
                 pkt_data,
                 len(data),
                 timestamp,
             )
-            
+            # ngtcp2 may set conn->log.last_ts > ts even when read_pkt returns error; ensure
+            # next write_pkt gets ts strictly greater so conn_update_timestamp assertion holds
+            self._last_ts = max(self._last_ts, timestamp + 1_000_000)  # advance 1ms
+
             if result != 0:
-                logger.warning(f"ngtcp2_conn_read_pkt returned error: {result}")
+                err_msg = _ngtcp2_read_pkt_error_message(result)
+                logger.warning(f"ngtcp2_conn_read_pkt returned error: {result} ({err_msg})")
+                if result in (
+                    -225,  # NGTCP2_ERR_TRANSPORT_PARAM
+                    -215,  # NGTCP2_ERR_REQUIRED_TRANSPORT_PARAM
+                    -216,  # NGTCP2_ERR_MALFORMED_TRANSPORT_PARAM
+                ):
+                    logger.info(
+                        "QUIC transport parameter error: client params failed validation. "
+                        "Ensure client sends valid params (e.g. active_connection_id_limit>=2, "
+                        "max_ack_delay in range). Client and server ngtcp2 versions should match."
+                    )
                 return False
-            
+
             self.packets_received += 1
             self.bytes_received += len(data)
             self.last_packet_at = time.time()
@@ -431,7 +630,7 @@ class NGTCP2Connection:
             
             # Check if handshake completed
             if ngtcp2_conn_get_handshake_completed:
-                if ngtcp2_conn_get_handshake_completed(self.conn):
+                if ngtcp2_conn_get_handshake_completed(self._conn_ptr):
                     if not self.handshake_completed:
                         self.handshake_completed = True
                         self.state = "connected"
@@ -460,8 +659,11 @@ class NGTCP2Connection:
         
         try:
             if timestamp is None:
-                timestamp = int(time.time() * NGTCP2_SECONDS)
-            
+                timestamp = time.monotonic_ns()
+            # ngtcp2 requires conn->log.last_ts <= ts (monotonic); clamp to last used ts
+            timestamp = max(timestamp, getattr(self, '_last_ts', self.settings.initial_ts))
+            self._last_ts = timestamp
+
             # Write packets (ngtcp2 will call our send callback)
             # We need to call ngtcp2_conn_write_pkt in a loop until no more packets
             max_packets = MAX_PKT_BURST
@@ -472,20 +674,18 @@ class NGTCP2Connection:
                 pkt_buf = (c_uint8 * MAX_UDP_PAYLOAD_SIZE)()
                 pktlen = c_size_t(0)
                 
-                # Write packet
+                # Write packet (unified 6-arg API: conn, path, dest, destlen, pdatalen, ts)
                 result = ngtcp2_conn_write_pkt(
-                    self.conn,
-                    byref(self.path_storage.ps) if self.path else None,
+                    self._conn_ptr,
+                    byref(self.path_storage.ps),
                     pkt_buf,
                     MAX_UDP_PAYLOAD_SIZE,
                     byref(pktlen),
                     timestamp,
-                    self.user_data_ptr,
-                    None,  # send_pkt callback (handled via Python)
                 )
                 
-                if result != 0:
-                    # No more packets to send or error
+                if result < 0:
+                    # Error (negative ngtcp2_ssize)
                     break
                 
                 if pktlen.value > 0:
@@ -516,17 +716,17 @@ class NGTCP2Connection:
         
         try:
             if timestamp is None:
-                timestamp = int(time.time() * NGTCP2_SECONDS)
+                timestamp = time.monotonic_ns()
             
             # Get expiry time
             if ngtcp2_conn_get_expiry:
-                expiry = ngtcp2_conn_get_expiry(self.conn)
+                expiry = ngtcp2_conn_get_expiry(self._conn_ptr)
                 if expiry != 0xFFFFFFFFFFFFFFFF:  # UINT64_MAX
                     if expiry <= timestamp:
                         # Handle expiry
                         result = ngtcp2_conn_handle_expiry(
-                            self.conn,
-                            byref(self.path_storage.ps) if self.path else None,
+                            self._conn_ptr,
+                            byref(self.path_storage.ps),
                             timestamp,
                             self.user_data_ptr,
                             None,  # send_pkt callback
@@ -592,12 +792,12 @@ class NGTCP2Connection:
             return
         
         try:
-            timestamp = int(time.time() * NGTCP2_SECONDS)
+            timestamp = time.monotonic_ns()
             if ngtcp2_conn_close:
                 # ngtcp2_conn_close is a wrapper that handles packet sending
                 result = ngtcp2_conn_close(
-                    self.conn,
-                    byref(self.path_storage.ps) if self.path else None,
+                    self._conn_ptr,
+                    byref(self.path_storage.ps),
                     error_code,
                     None,  # reason (not used in wrapper)
                     0,  # reasonlen
@@ -625,13 +825,20 @@ class NGTCP2Connection:
             stream.close()
         self.streams.clear()
         
-        # Delete ngtcp2 connection
-        if self.conn and ngtcp2_conn_del:
+        # Delete ngtcp2 connection (must pass actual conn pointer)
+        if self._conn_ptr and ngtcp2_conn_del:
             try:
-                ngtcp2_conn_del(self.conn, None)  # mem = NULL
+                ngtcp2_conn_del(self._conn_ptr, None)  # mem = NULL
             except Exception as e:
                 logger.warning(f"Error deleting ngtcp2 connection: {e}")
+        self._conn_ptr = None
         self.conn = None
+        
+        # Free TLS session
+        if self.tls_session:
+            free_tls_session(self.tls_session)
+            self.tls_session = None
+        
         self.state = "closed"
 
 
@@ -712,6 +919,16 @@ class QUICServerNGTCP2:
         """Start QUIC server"""
         loop = asyncio.get_event_loop()
         
+        # Create server TLS context with certificate and key (OpenSSL 3.x = TLS 1.3)
+        if self.certfile and self.keyfile:
+            tls_ctx = create_server_tls_ctx(self.certfile, self.keyfile)
+            if not tls_ctx:
+                logger.error("Failed to create server TLS context - QUIC handshakes will fail")
+            else:
+                logger.info("Created server TLS context for QUIC")
+        else:
+            logger.warning("No certificate/key files provided - QUIC handshakes will fail")
+        
         # Create UDP socket
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -749,7 +966,7 @@ class QUICServerNGTCP2:
         """Periodic connection maintenance (expiry, timeouts)"""
         while self.transport and not self.transport.is_closing():
             try:
-                timestamp = int(time.time() * NGTCP2_SECONDS)
+                timestamp = time.monotonic_ns()
                 
                 # Handle expiry for all connections
                 for conn in list(self.connections.values()):
@@ -822,13 +1039,18 @@ class QUICServerNGTCP2:
                     return
             
             # Process packet in connection
-            timestamp = int(time.time() * NGTCP2_SECONDS)
+            timestamp = time.monotonic_ns()
             if conn.recv_packet(data, timestamp):
                 # Try to send any pending packets
                 conn.send_packets(timestamp)
             else:
                 logger.warning(f"Failed to process packet for connection {dcid.hex()[:8]}")
-                
+                # Remove connection so maintenance never calls send_packets (avoids ngtcp2
+                # conn_update_timestamp assertion when conn->log.last_ts > ts after read_pkt error)
+                if dcid in self.connections:
+                    self.connections.pop(dcid)
+                    conn.cleanup()
+
         except Exception as e:
             logger.error(f"Error handling packet: {e}", exc_info=True)
     
