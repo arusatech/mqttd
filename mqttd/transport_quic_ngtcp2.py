@@ -36,6 +36,7 @@ try:
         ngtcp2_conn_server_new, ngtcp2_accept, ngtcp2_conn_read_pkt,
         ngtcp2_conn_write_pkt, ngtcp2_conn_handle_expiry, ngtcp2_conn_close,
         ngtcp2_conn_get_expiry, ngtcp2_conn_get_handshake_completed, ngtcp2_conn_del,
+        ngtcp2_conn_get_remote_transport_params,
         ngtcp2_conn_extend_max_stream_offset, ngtcp2_conn_extend_max_offset,
         ngtcp2_conn_shutdown_stream, ngtcp2_conn_set_stream_user_data,
         ngtcp2_conn_get_stream_user_data,
@@ -44,6 +45,7 @@ try:
         NGTCP2_MAX_CIDLEN, NGTCP2_PROTO_VER_V1, NGTCP2_MAX_UDP_PAYLOAD_SIZE,
         NGTCP2_DEFAULT_MAX_RECV_UDP_PAYLOAD_SIZE,
         NGTCP2_DEFAULT_ACK_DELAY_EXPONENT, NGTCP2_DEFAULT_MAX_ACK_DELAY,
+        NGTCP2_DEFAULT_ACTIVE_CONNECTION_ID_LIMIT,
     )
 except ImportError:
     from mqttd.ngtcp2_bindings import (
@@ -55,6 +57,7 @@ except ImportError:
         ngtcp2_conn_server_new, ngtcp2_accept, ngtcp2_conn_read_pkt,
         ngtcp2_conn_write_pkt, ngtcp2_conn_handle_expiry, ngtcp2_conn_close,
         ngtcp2_conn_get_expiry, ngtcp2_conn_get_handshake_completed, ngtcp2_conn_del,
+        ngtcp2_conn_get_remote_transport_params,
         ngtcp2_conn_extend_max_stream_offset, ngtcp2_conn_extend_max_offset,
         ngtcp2_conn_shutdown_stream, ngtcp2_conn_set_stream_user_data,
         ngtcp2_conn_get_stream_user_data,
@@ -63,6 +66,7 @@ except ImportError:
         NGTCP2_MAX_CIDLEN, NGTCP2_PROTO_VER_V1, NGTCP2_MAX_UDP_PAYLOAD_SIZE,
         NGTCP2_DEFAULT_MAX_RECV_UDP_PAYLOAD_SIZE,
         NGTCP2_DEFAULT_ACK_DELAY_EXPONENT, NGTCP2_DEFAULT_MAX_ACK_DELAY,
+        NGTCP2_DEFAULT_ACTIVE_CONNECTION_ID_LIMIT,
     )
 
 # Import TLS bindings
@@ -621,6 +625,24 @@ class NGTCP2Connection:
                         "Ensure client sends valid params (e.g. active_connection_id_limit>=2, "
                         "max_ack_delay in range). Client and server ngtcp2 versions should match."
                     )
+                    # Debug: log decoded client transport params if available (may be NULL on -225)
+                    if result == -225 and ngtcp2_conn_get_remote_transport_params:
+                        try:
+                            rtp = ngtcp2_conn_get_remote_transport_params(self._conn_ptr)
+                            if rtp:
+                                p = rtp.contents
+                                logger.info(
+                                    "Decoded client transport params: active_connection_id_limit=%s, "
+                                    "max_ack_delay=%s ns (valid: active_connection_id_limit>=%s, "
+                                    "max_ack_delay < 16384 ms)",
+                                    getattr(p, "active_connection_id_limit", "?"),
+                                    getattr(p, "max_ack_delay", "?"),
+                                    NGTCP2_DEFAULT_ACTIVE_CONNECTION_ID_LIMIT,
+                                )
+                            else:
+                                logger.info("Decoded client transport params: (NULL - not set before validation failure)")
+                        except Exception as e:
+                            logger.debug("Could not get remote transport params: %s", e)
                 return False
 
             self.packets_received += 1

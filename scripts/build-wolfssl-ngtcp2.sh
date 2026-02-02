@@ -62,6 +62,8 @@ if [ ! -f ./configure ]; then
     fi
 fi
 [ ! -f ./configure ] && { echo "Error: configure not found"; exit 1; }
+# Static lib must be built with -fPIC so ngtcp2 can link it into shared libs
+export CFLAGS="${CFLAGS:-} -fPIC"
 WOLFSSL_QUIC_OPT=""
 [ "$ENABLE_QUIC" = "1" ] && WOLFSSL_QUIC_OPT="--enable-quic"
 ./configure \
@@ -74,6 +76,8 @@ WOLFSSL_QUIC_OPT=""
     --disable-crypttests \
     --enable-opensslall \
     --enable-base64encode
+# Rebuild objects with current CFLAGS (e.g. -fPIC) if Makefile changed
+make clean 2>/dev/null || true
 make -j$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)
 sudo make install
 sudo ldconfig 2>/dev/null || true
@@ -94,6 +98,7 @@ mkdir -p "$NGTCP2_SRC/build" && cd "$NGTCP2_SRC/build"
 cmake .. \
     -DCMAKE_INSTALL_PREFIX="$PREFIX" \
     -DENABLE_LIB_ONLY=ON \
+    -DBUILD_TESTING=OFF \
     -DENABLE_WOLFSSL=ON \
     -DENABLE_OPENSSL=OFF
 make -j$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)

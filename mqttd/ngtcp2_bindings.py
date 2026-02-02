@@ -969,7 +969,7 @@ if NGTCP2_AVAILABLE and _ngtcp2_lib:
     
     try:
         ngtcp2_conn_get_remote_transport_params = lib.ngtcp2_conn_get_remote_transport_params
-        ngtcp2_conn_get_remote_transport_params.argtypes = [ngtcp2_conn]
+        ngtcp2_conn_get_remote_transport_params.argtypes = [POINTER(ngtcp2_conn)]
         ngtcp2_conn_get_remote_transport_params.restype = POINTER(ngtcp2_transport_params)
     except AttributeError:
         ngtcp2_conn_get_remote_transport_params = None
