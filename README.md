@@ -72,12 +72,14 @@ pip install -e .
 
 ### Optional Dependencies
 
-For QUIC support with ngtcp2 (production-grade):
+**Build server first (QUIC with ngtcp2 + WolfSSL):**  
+To run MQTT-over-QUIC with the production ngtcp2 backend, build C libs then install the Python package:
+
 ```bash
-# Install ngtcp2 C library (system package)
-# See: https://github.com/ngtcp2/ngtcp2
-# Then install Python bindings if available
+./scripts/build-server.sh   # WolfSSL + ngtcp2, then pip install -e .
 ```
+
+See [docs/BUILD_SERVER.md](docs/BUILD_SERVER.md) for prerequisites, manual steps, and troubleshooting.
 
 For development:
 ```bash
