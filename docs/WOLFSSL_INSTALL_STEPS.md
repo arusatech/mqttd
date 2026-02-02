@@ -1,5 +1,9 @@
 # wolfSSL Installation Steps - Ready to Install
 
+**Same TLS backend and versions:** The capacitor-mqtt-quic client (iOS/Android) and mqttd server both use **WolfSSL by default** (TLS 1.3 + QUIC) for ngtcp2. The mqttd build script uses the **same commit/tag versions** as the client: it sources `ref-code/capacitor-mqtt-quic/deps-versions.sh` when present, so WolfSSL tag (e.g. `v5.8.4-stable`) and ngtcp2 commit match; see also `ref-code/VERSION.txt`.
+
+**Quick build (server):** From mqttd root, run `./scripts/build-wolfssl-ngtcp2.sh [--prefix /usr/local]`. This builds and installs WolfSSL and ngtcp2 with WolfSSL by default, using the same versions as the client (requires ref-code/wolfssl-5.8.4-stable and ref-code/ngtcp2, or set paths via `--wolfssl-src` / `--ngtcp2-src`).
+
 ## Current Status
 
 ✅ **wolfSSL has been built successfully** with QUIC support
