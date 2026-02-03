@@ -79,6 +79,47 @@ Reference: [OASIS MQTT v5.0](https://docs.oasis-open.org/mqtt/mqtt/v5.0/mqtt-v5.
 | AUTH packet type and exchange | ❌ | No AUTH in `MQTTMessageType` or handling |
 | CONNECT/CONNACK Auth Method/Data | ✅ | Properties only; no challenge/response flow |
 
+### Understanding AUTH from the spec (§3.15, §4.12)
+
+**What AUTH is**
+
+- **AUTH** is MQTT v5.0 Control Packet type **15** (Spec Table 2-1). It is used only for **enhanced (challenge/response) authentication**.
+- The spec: *"An AUTH packet is sent from Client to Server or Server to Client as part of an extended authentication exchange, such as challenge / response authentication."*
+- Sending AUTH when CONNECT did **not** include the same **Authentication Method** is a **Protocol Error** (§3.15).
+
+**When AUTH is used**
+
+- **Optional.** If the client does **not** include **Authentication Method** in CONNECT, the server must not send AUTH; the client must not send AUTH. Normal (e.g. username/password) auth can still apply.
+- **When CONNECT has Authentication Method:** the client requests enhanced auth. The server may send **AUTH** with reason code **0x18 (Continue authentication)** and optional **Authentication Data**. The client responds with AUTH (0x18) and optional data. The exchange continues until the server sends **CONNACK** with **0x00 (Success)** or rejects (CONNACK reason ≥ 0x80) and closes.
+- **Rule:** If the client sent Authentication Method in CONNECT, the client **must not** send any packet other than **AUTH** or **DISCONNECT** until it has received CONNACK (§3.1.4).
+
+**AUTH packet format (§3.15)**
+
+- **Fixed header:** Packet type 15; reserved bits 0.
+- **Variable header:**
+  - **Authenticate Reason Code** (1 byte): **0x00** Success (server); **0x18** Continue authentication (client or server); **0x19** Re-authenticate (client only, after connection).
+  - **Properties:** Property Length, then optional Authentication Method (0x15), Authentication Data (0x16), Reason String (0x1F), User Property (0x26). All AUTH packets and a successful CONNACK in that exchange must use the **same** Authentication Method as in CONNECT.
+- **Payload:** None.
+
+**Initial authentication flow (§4.12)**
+
+1. Client sends **CONNECT** with **Authentication Method** (e.g. `"SCRAM-SHA-1"`) and optionally **Authentication Data**.
+2. If the server does not support it: CONNACK **0x8C** or **0x87** and close.
+3. If the server needs more data: **AUTH** with **0x18** and optional Authentication Data.
+4. Client sends **AUTH** with **0x18** and optional Authentication Data; repeat 3–4 as the mechanism requires.
+5. Server ends with **CONNACK 0x00** (success) or CONNACK ≥ 0x80 and close (failure).
+
+**Re-authentication (§4.12.1)**
+
+- After CONNACK, the client may send **AUTH** with reason **0x19 (Re-authenticate)** and the same Authentication Method to start re-auth. The server responds with AUTH **0x00** (Success) or **0x18** (Continue). Other traffic may continue during re-auth.
+
+**What mqttd has vs what's missing**
+
+- **Has:** CONNECT and CONNACK can carry **Authentication Method** and **Authentication Data** as properties (encode/decode in `properties.py` / `protocol_v5.py`).
+- **Missing:** AUTH as a packet type in `MQTTMessageType`; send/parse of AUTH; logic for CONNECT → AUTH → … → CONNACK (or reject); enforcement that the client sends only AUTH or DISCONNECT until CONNACK; re-authentication (AUTH 0x19) after connection.
+
+So enhanced authentication (challenge/response and re-auth) is **not implemented**; only the CONNECT/CONNACK properties for auth metadata exist.
+
 ## Request/Response (§4.10)
 
 | Feature | Status | Notes |
