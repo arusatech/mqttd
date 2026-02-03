@@ -970,6 +970,14 @@ if NGTCP2_AVAILABLE and _ngtcp2_lib:
     except AttributeError:
         ngtcp2_conn_get_tls_alert = None
     
+    # Connection keep-alive
+    try:
+        ngtcp2_conn_set_keep_alive_timeout = lib.ngtcp2_conn_set_keep_alive_timeout
+        ngtcp2_conn_set_keep_alive_timeout.argtypes = [POINTER(ngtcp2_conn), c_uint64]
+        ngtcp2_conn_set_keep_alive_timeout.restype = None
+    except AttributeError:
+        ngtcp2_conn_set_keep_alive_timeout = None
+    
     try:
         ngtcp2_conn_get_remote_transport_params = lib.ngtcp2_conn_get_remote_transport_params
         ngtcp2_conn_get_remote_transport_params.argtypes = [POINTER(ngtcp2_conn)]

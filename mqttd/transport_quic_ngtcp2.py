@@ -44,6 +44,7 @@ try:
         ngtcp2_conn_extend_max_stream_offset, ngtcp2_conn_extend_max_offset,
         ngtcp2_conn_shutdown_stream, ngtcp2_conn_set_stream_user_data,
         ngtcp2_conn_get_stream_user_data,
+        ngtcp2_conn_set_keep_alive_timeout,
         ngtcp2_strm_recv, ngtcp2_strm_write, ngtcp2_strm_shutdown,
         ngtcp2_conn_submit_stream_data, ngtcp2_conn_writev_stream_versioned,
         NGTCP2_MILLISECONDS, NGTCP2_SECONDS, NGTCP2_MICROSECONDS,
@@ -69,6 +70,7 @@ except ImportError:
         ngtcp2_conn_extend_max_stream_offset, ngtcp2_conn_extend_max_offset,
         ngtcp2_conn_shutdown_stream, ngtcp2_conn_set_stream_user_data,
         ngtcp2_conn_get_stream_user_data,
+        ngtcp2_conn_set_keep_alive_timeout,
         ngtcp2_strm_recv, ngtcp2_strm_write, ngtcp2_strm_shutdown,
         ngtcp2_conn_submit_stream_data, ngtcp2_conn_writev_stream_versioned,
         NGTCP2_MILLISECONDS, NGTCP2_SECONDS, NGTCP2_MICROSECONDS,
@@ -487,6 +489,11 @@ class NGTCP2Connection:
             
             # Create and associate TLS session with the connection
             self.tls_session = create_server_tls_session()
+
+            # Enable QUIC keep-alive packets to prevent idle timeout (30s server idle).
+            # Send keep-alive after 10s of inactivity.
+            if ngtcp2_conn_set_keep_alive_timeout:
+                ngtcp2_conn_set_keep_alive_timeout(self._conn_ptr, 10 * NGTCP2_SECONDS)
             if not self.tls_session:
                 logger.error("Failed to create TLS session for connection")
                 return False
@@ -616,15 +623,15 @@ class NGTCP2Connection:
             self.path_storage.path.user_data = None
             
             # Debug: verify the copy worked
-            local_buf_hex = ctypes.string_at(ctypes.addressof(self.path_storage.local_addrbuf), 16).hex()
-            remote_buf_hex = ctypes.string_at(ctypes.addressof(self.path_storage.remote_addrbuf), 16).hex()
-            logger.info(
-                f"Path storage manually initialized: "
-                f"local={local_host}:{self.server.port} (hex={local_buf_hex}), "
-                f"remote={self.remote_addr[0]}:{self.remote_addr[1]} (hex={remote_buf_hex}), "
-                f"local.addr=0x{self.path_storage.path.local.addr:x}, "
-                f"remote.addr=0x{self.path_storage.path.remote.addr:x}"
-            )
+            # local_buf_hex = ctypes.string_at(ctypes.addressof(self.path_storage.local_addrbuf), 16).hex()
+            # remote_buf_hex = ctypes.string_at(ctypes.addressof(self.path_storage.remote_addrbuf), 16).hex()
+            # logger.info(
+            #     f"Path storage manually initialized: "
+            #     f"local={local_host}:{self.server.port} (hex={local_buf_hex}), "
+            #     f"remote={self.remote_addr[0]}:{self.remote_addr[1]} (hex={remote_buf_hex}), "
+            #     f"local.addr=0x{self.path_storage.path.local.addr:x}, "
+            #     f"remote.addr=0x{self.path_storage.path.remote.addr:x}"
+            # )
         except Exception as e:
             logger.error(f"Failed to initialize path storage: {e}", exc_info=True)
             raise
@@ -686,7 +693,7 @@ class NGTCP2Connection:
                     stream.append_data(payload, fin=bool(flags & NGTCP2_STREAM_DATA_FLAG_FIN))
                     if not getattr(conn_obj, "_logged_first_stream", False):
                         conn_obj._logged_first_stream = True
-                        logger.info("Received stream data: stream_id=%s len=%s", stream_id, datalen)
+        # logger.info("Received stream data: stream_id=%s len=%s", stream_id, datalen)
                     # Update flow control windows so peer can continue sending
                     if ngtcp2_conn_extend_max_stream_offset:
                         ngtcp2_conn_extend_max_stream_offset(conn_obj._conn_ptr, stream_id, datalen)
@@ -767,21 +774,21 @@ class NGTCP2Connection:
             path_ptr = byref(self.path_storage.path)
             
             # Debug: Compare our path with ngtcp2's internal path
-            if ngtcp2_conn_get_path:
-                internal_path = ngtcp2_conn_get_path(self._conn_ptr)
-                if internal_path:
-                    # Log both paths for comparison
-                    our_local = ctypes.string_at(self.path_storage.path.local.addr, self.path_storage.path.local.addrlen).hex()
-                    our_remote = ctypes.string_at(self.path_storage.path.remote.addr, self.path_storage.path.remote.addrlen).hex()
-                    ngtcp2_local = ctypes.string_at(internal_path.contents.local.addr, internal_path.contents.local.addrlen).hex()
-                    ngtcp2_remote = ctypes.string_at(internal_path.contents.remote.addr, internal_path.contents.remote.addrlen).hex()
-                    
-                    paths_match = (our_local == ngtcp2_local and our_remote == ngtcp2_remote)
-                    logger.info(
-                        f"Path comparison: match={paths_match}\n"
-                        f"  Our path:     local={our_local} remote={our_remote}\n"
-                        f"  ngtcp2 path:  local={ngtcp2_local} remote={ngtcp2_remote}"
-                    )
+            # if ngtcp2_conn_get_path:
+            #     internal_path = ngtcp2_conn_get_path(self._conn_ptr)
+            #     if internal_path:
+            #         # Log both paths for comparison
+            #         our_local = ctypes.string_at(self.path_storage.path.local.addr, self.path_storage.path.local.addrlen).hex()
+            #         our_remote = ctypes.string_at(self.path_storage.path.remote.addr, self.path_storage.path.remote.addrlen).hex()
+            #         ngtcp2_local = ctypes.string_at(internal_path.contents.local.addr, internal_path.contents.local.addrlen).hex()
+            #         ngtcp2_remote = ctypes.string_at(internal_path.contents.remote.addr, internal_path.contents.remote.addrlen).hex()
+            #         
+            #         paths_match = (our_local == ngtcp2_local and our_remote == ngtcp2_remote)
+            #         logger.info(
+            #             f"Path comparison: match={paths_match}\n"
+            #             f"  Our path:     local={our_local} remote={our_remote}\n"
+            #             f"  ngtcp2 path:  local={ngtcp2_local} remote={ngtcp2_remote}"
+            #         )
 
             # Convert data to ctypes
             pkt_data = (c_uint8 * len(data)).from_buffer_copy(data)
@@ -804,7 +811,7 @@ class NGTCP2Connection:
                 if ngtcp2_conn_get_timestamp and self._conn_ptr:
                     self._last_ts = max(self._last_ts, ngtcp2_conn_get_timestamp(self._conn_ptr))
 
-            logger.info(f"ngtcp2_conn_read_pkt returned {result} for {len(data)} bytes from {addr}")
+            # logger.info(f"ngtcp2_conn_read_pkt returned {result} for {len(data)} bytes from {addr}")
             
             # Debug: Check TLS alert if crypto error
             if result != 0 and ngtcp2_conn_get_tls_alert:
@@ -1017,14 +1024,14 @@ class NGTCP2Connection:
                         self.bytes_sent += pkt_len
                         self.last_io_at = time.time()
                         # Log first outgoing packet so we can confirm server is responding to client
-                        if packets_sent == 1 and not getattr(self, "_logged_first_send", False):
-                            self._logged_first_send = True
-                            logger.info(
-                                "Sent first QUIC response (len=%d) to %s:%d",
-                                len(pkt_data),
-                                self.remote_addr[0],
-                                self.remote_addr[1],
-                            )
+                        # if packets_sent == 1 and not getattr(self, "_logged_first_send", False):
+                        #     self._logged_first_send = True
+                        #     logger.info(
+                        #         "Sent first QUIC response (len=%d) to %s:%d",
+                        #         len(pkt_data),
+                        #         self.remote_addr[0],
+                        #         self.remote_addr[1],
+                        #     )
                         # Sync _last_ts with ngtcp2 so next write_pkt (same loop) gets ts >= conn->log.last_ts
                         if ngtcp2_conn_get_timestamp and self._conn_ptr:
                             self._last_ts = max(self._last_ts, ngtcp2_conn_get_timestamp(self._conn_ptr))
@@ -1037,17 +1044,17 @@ class NGTCP2Connection:
                             last_log = getattr(self, "_logged_write_pkt_zero_at", None)
                             if last_log is None or (now_sec - last_log) >= 5.0:
                                 self._logged_write_pkt_zero_at = now_sec
-                                logger.info(
-                                    "ngtcp2_conn_write_pkt returned 0 bytes (no packet to send). "
-                                    "Possible causes: (1) WolfSSL not producing ServerHello (check WOLFSSL: add handshake data logs), "
-                                    "(2) amplification limit (bytes_recv=0 so server_tx_left=0), "
-                                    "(3) pacing/congestion control. "
-                                    "Debug: pkts_received=%d, bytes_received=%d. "
-                                    "If handshake keeps timing out: rebuild ngtcp2 with PRINTF_DEBUG 1 in "
-                                    "crypto/wolfssl/wolfssl.c to see if recv_crypto_data/do_handshake run (stderr).",
-                                    self.packets_received,
-                                    self.bytes_received,
-                                )
+                                # logger.info(
+                                #     "ngtcp2_conn_write_pkt returned 0 bytes (no packet to send). "
+                                #     "Possible causes: (1) WolfSSL not producing ServerHello (check WOLFSSL: add handshake data logs), "
+                                #     "(2) amplification limit (bytes_recv=0 so server_tx_left=0), "
+                                #     "(3) pacing/congestion control. "
+                                #     "Debug: pkts_received=%d, bytes_received=%d. "
+                                #     "If handshake keeps timing out: rebuild ngtcp2 with PRINTF_DEBUG 1 in "
+                                #     "crypto/wolfssl/wolfssl.c to see if recv_crypto_data/do_handshake run (stderr).",
+                                #     self.packets_received,
+                                #     self.bytes_received,
+                                # )
                         break
 
             return True
@@ -1436,7 +1443,6 @@ class QUICServerNGTCP2:
                 conn.send_packets(timestamp)
                 if not getattr(conn, "_logged_first_recv", False):
                     conn._logged_first_recv = True
-                    logger.info("Processed first packet, sent response (if any)")
                     # Retry send after short delays in case crypto produces data asynchronously
                     if conn.state == "handshake":
                         try:
