@@ -783,7 +783,12 @@ class MQTTApp:
             # Send SUBACK (MQTT 5.0 with reason codes if applicable)
             if not self._config.get('publish_before_suback', False):
                 if is_mqtt5:
-                    suback = MQTT5Protocol.build_suback_v5(packet_id, [ReasonCode.GRANTED_QOS_0 + min(qos, 2)])
+                    granted_codes = [
+                        ReasonCode.GRANTED_QOS_0,
+                        ReasonCode.GRANTED_QOS_1,
+                        ReasonCode.GRANTED_QOS_2,
+                    ]
+                    suback = MQTT5Protocol.build_suback_v5(packet_id, [granted_codes[min(qos, 2)]])
                 else:
                     suback = MQTTProtocol.build_suback(packet_id, 0)
                 writer.write(suback)
@@ -804,7 +809,12 @@ class MQTTApp:
             # Send SUBACK if not sent before
             if self._config.get('publish_before_suback', False):
                 if is_mqtt5:
-                    suback = MQTT5Protocol.build_suback_v5(packet_id, [ReasonCode.GRANTED_QOS_0 + min(qos, 2)])
+                    granted_codes = [
+                        ReasonCode.GRANTED_QOS_0,
+                        ReasonCode.GRANTED_QOS_1,
+                        ReasonCode.GRANTED_QOS_2,
+                    ]
+                    suback = MQTT5Protocol.build_suback_v5(packet_id, [granted_codes[min(qos, 2)]])
                 else:
                     suback = MQTTProtocol.build_suback(packet_id, 0)
                 writer.write(suback)

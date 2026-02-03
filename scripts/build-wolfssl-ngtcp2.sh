@@ -70,7 +70,7 @@ WOLFSSL_QUIC_OPT=""
     --prefix="$PREFIX" \
     $WOLFSSL_QUIC_OPT \
     --enable-tls13 \
-    --disable-shared \
+    --enable-shared \
     --enable-static \
     --disable-examples \
     --disable-crypttests \

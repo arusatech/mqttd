@@ -67,8 +67,11 @@ pip install -e .
 ```bash
 pkg-config --exists wolfssl && echo "WolfSSL OK"
 pkg-config --exists libngtcp2_crypto_wolfssl && echo "ngtcp2+wolfssl OK"
+# With LD_LIBRARY_PATH so Python loads /usr/local WolfSSL ngtcp2 crypto
+export LD_LIBRARY_PATH=/usr/local/lib64:/usr/local/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}
 python3 -c "from mqttd.ngtcp2_tls_bindings import init_tls_backend, USE_WOLFSSL; print('wolfSSL:', USE_WOLFSSL, init_tls_backend())"
 ```
+Expect `wolfSSL: True True`. If you see `wolfSSL: False`, the process did not load libngtcp2_crypto_wolfssl (set `LD_LIBRARY_PATH` and try again).
 
 ---
 
@@ -80,7 +83,15 @@ python3 -c "from mqttd.ngtcp2_tls_bindings import init_tls_backend, USE_WOLFSSL;
    openssl req -x509 -newkey rsa:2048 -nodes -keyout key.pem -out cert.pem -days 365 -subj /CN=localhost
    ```
 
-2. **Run an example** (from mqttd root):
+2. **Use WolfSSL ngtcp2 at runtime** – On RHEL/AlmaLinux/Fedora the libs install to `/usr/local/lib64`. The dynamic linker must see them (and their deps: libwolfssl, libngtcp2). Set `LD_LIBRARY_PATH` **before** starting the server:
+
+   ```bash
+   export LD_LIBRARY_PATH=/usr/local/lib64:/usr/local/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}
+   ```
+
+   Optional: require WolfSSL and fail if not found: `export MQTTD_QUIC_USE_WOLFSSL=1`
+
+3. **Run an example** (from mqttd root):
 
    ```bash
    python3 examples/mqtt_quic_server.py
@@ -92,7 +103,7 @@ python3 -c "from mqttd.ngtcp2_tls_bindings import init_tls_backend, USE_WOLFSSL;
    python3 examples/mqtt_quic_only_server.py
    ```
 
-   Ensure `quic_certfile` / `quic_keyfile` in the example point to your cert and key (e.g. `cert.pem`, `key.pem`).
+   Ensure `quic_certfile` / `quic_keyfile` in the example point to your cert and key (e.g. `cert.pem`, `key.pem`). You should see **"Bound ngtcp2_crypto_wolfssl_init"** in the log; if you see "Bound ngtcp2_crypto_ossl_init", WolfSSL was not loaded (check `LD_LIBRARY_PATH`).
 
 ---
 
@@ -102,3 +113,7 @@ python3 -c "from mqttd.ngtcp2_tls_bindings import init_tls_backend, USE_WOLFSSL;
 - **ngtcp2 source not found**: `git clone https://github.com/ngtcp2/ngtcp2.git ref-code/ngtcp2`; the build script will checkout the pinned commit from `deps-versions.sh`.
 - **aclocal/libtool (macOS)**: Install libtool and, if needed, set `ACLOCAL_PATH` as in Prerequisites.
 - **pkg-config not found after custom prefix**: Set `PKG_CONFIG_PATH` and `LD_LIBRARY_PATH` to your prefix’s `lib/pkgconfig` and `lib`.
+
+- **"Bound ngtcp2_crypto_ossl_init" / server using OpenSSL**: The server prefers WolfSSL but **could not find** `libngtcp2_crypto_wolfssl.so`. Install WolfSSL + ngtcp2 on the **server machine**: run `./scripts/build-wolfssl-ngtcp2.sh` (from mqttd root, with ref-code layout). On RHEL/AlmaLinux/Fedora the install goes to `/usr/local/lib64`; mqttd looks there first. If needed, start the server with `LD_LIBRARY_PATH=/usr/local/lib64` (or `/usr/local/lib` on macOS). Until WolfSSL ngtcp2 is installed, the server falls back to OpenSSL and you may see NGTCP2_ERR_TRANSPORT_PARAM (-225) with the capacitor-mqtt-quic client.
+
+**NGTCP2_ERR_TRANSPORT_PARAM (-225)** – client params failed validation: (1) Use the same ngtcp2 version on client and server: build server with `./scripts/build-wolfssl-ngtcp2.sh` (uses `NGTCP2_COMMIT` from deps-versions.sh). (2) Use WolfSSL on the server so it matches the client: install WolfSSL + ngtcp2 on the server (see above); on RHEL/AlmaLinux use `LD_LIBRARY_PATH=/usr/local/lib64` (or `/usr/local/lib`) when starting if the loader does not find the libs. (3) Same ngtcp2 commit on both sides avoids transport-param encoding/validation mismatches.

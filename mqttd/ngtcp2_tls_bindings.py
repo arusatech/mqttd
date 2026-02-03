@@ -17,7 +17,7 @@ Reference:
 import ctypes
 from ctypes import (
     CDLL, Structure, POINTER, CFUNCTYPE, byref,
-    c_int, c_int32, c_int64, c_uint8, c_uint16, c_uint32, c_uint64,
+    c_int, c_int32, c_int64, c_uint, c_uint8, c_uint16, c_uint32, c_uint64, c_ubyte,
     c_size_t, c_ssize_t, c_void_p, c_char_p, c_bool,
     Array, cast
 )
@@ -130,6 +130,28 @@ def _load_wolfssl_library():
     return False
 
 
+def _local_lib_dirs():
+    """Return ($HOME/.local/lib64, $HOME/.local/lib) using runtime HOME. Prefer $HOME/.local for builds with --prefix $HOME/.local."""
+    home = os.environ.get("HOME") or os.path.expanduser("~")
+    return (os.path.join(home, ".local", "lib64"), os.path.join(home, ".local", "lib"))
+
+
+def _prepend_ld_library_path():
+    """Prepend $HOME/.local then /usr/local to LD_LIBRARY_PATH so the loader finds
+    libngtcp2_crypto_wolfssl and its dependencies. Uses runtime HOME.
+    Only affects the current process; safe to call multiple times (idempotent for first call).
+    """
+    key = "LD_LIBRARY_PATH"
+    local64, local_lib = _local_lib_dirs()
+    parts = [d for d in (local64, local_lib) if os.path.isdir(d)]
+    parts.extend(["/usr/local/lib64", "/usr/local/lib"])
+    prefix = ":".join(parts)
+    current = os.environ.get(key, "")
+    first = parts[0] if parts else ""
+    if not (first and current.startswith(first)):
+        os.environ[key] = f"{prefix}{':' + current if current else ''}"
+
+
 def _load_ngtcp2_crypto_library():
     """Load ngtcp2 crypto library (OpenSSL or wolfSSL backend)"""
     global _ngtcp2_crypto_lib, NGTCP2_CRYPTO_AVAILABLE, USE_OPENSSL, USE_WOLFSSL
@@ -137,31 +159,63 @@ def _load_ngtcp2_crypto_library():
     if _ngtcp2_crypto_lib is not None:
         return NGTCP2_CRYPTO_AVAILABLE
     
-    # Try to determine which TLS backend ngtcp2 was built with
-    # Based on curl's implementation, we check for specific symbols
-    
+    # Prefer $HOME/.local (build-server.sh --prefix $HOME/.local); set LD_LIBRARY_PATH first
+    _prepend_ld_library_path()
+    local64, local_lib = _local_lib_dirs()
+
+    # Try to determine which TLS backend ngtcp2 was built with.
+    # Prefer WolfSSL first so server matches client (capacitor-mqtt-quic uses WolfSSL by default).
     lib_names = [
-        'libngtcp2_crypto_ossl.so',
-        'libngtcp2_crypto_ossl.so.0',
-        'libngtcp2_crypto_ossl.so.0.1.1',  # Full version
         'libngtcp2_crypto_wolfssl.so',
         'libngtcp2_crypto_wolfssl.so.0',
+        'libngtcp2_crypto_ossl.so',
+        'libngtcp2_crypto_ossl.so.0',
+        'libngtcp2_crypto_ossl.so.0.1.1',
         'libngtcp2_crypto_quictls.so',
         'libngtcp2_crypto_quictls.so.0',
     ]
-    
-    # Also try with full path
-    import os
-    full_paths = [
-        '/usr/local/lib/libngtcp2_crypto_ossl.so',
-        '/usr/local/lib/libngtcp2_crypto_ossl.so.0',
-        '/usr/local/lib/libngtcp2_crypto_ossl.so.0.1.1',
-        '/usr/local/lib/libngtcp2_crypto_wolfssl.so',
-        '/usr/local/lib/libngtcp2_crypto_wolfssl.so.0',
+
+    # Filesystem-driven path order: only try dirs that contain the library, $HOME/.local first.
+    # Preferred order: $HOME/.local/lib64, $HOME/.local/lib, /usr/local/lib64, /usr/local/lib.
+    # RHEL puts .so in lib64; checking existence avoids trying /usr/local when lib is in .local.
+    _WOLFSSL_BASES = (
+        "libngtcp2_crypto_wolfssl.so",
+        "libngtcp2_crypto_wolfssl.so.5",
+        "libngtcp2_crypto_wolfssl.so.5.3.1",
+    )
+    _PREFERRED_DIRS = (
+        local64,
+        local_lib,
+        "/usr/local/lib64",
+        "/usr/local/lib",
+    )
+
+    full_paths = []
+    for _dir in _PREFERRED_DIRS:
+        if not os.path.isdir(_dir):
+            continue
+        if any(os.path.lexists(os.path.join(_dir, b)) for b in _WOLFSSL_BASES):
+            full_paths.extend(os.path.join(_dir, b) for b in _WOLFSSL_BASES)
+            break
+    if not full_paths:
+        full_paths = [os.path.join(d, b) for d in _PREFERRED_DIRS for b in _WOLFSSL_BASES if os.path.isdir(d)]
+
+    # OpenSSL fallbacks: same order ($HOME/.local/lib64, .local/lib, /usr/local)
+    _OSSL_PATHS = [
+        os.path.join(local64, "libngtcp2_crypto_ossl.so"),
+        os.path.join(local_lib, "libngtcp2_crypto_ossl.so"),
+        "/usr/local/lib64/libngtcp2_crypto_ossl.so",
+        "/usr/local/lib64/libngtcp2_crypto_ossl.so.0",
+        "/usr/local/lib/libngtcp2_crypto_ossl.so",
+        "/usr/local/lib/libngtcp2_crypto_ossl.so.0",
+        "/usr/local/lib/libngtcp2_crypto_ossl.so.0.1.1",
     ]
-    
-    all_lib_names = lib_names + full_paths
-    
+    full_paths.extend(_OSSL_PATHS)
+    require_wolfssl = os.environ.get("MQTTD_QUIC_USE_WOLFSSL", "").strip().lower() in ("1", "yes", "true")
+    all_lib_names = full_paths + lib_names
+    wolfssl_tried = False
+    first_wolfssl_load_error = None
+
     for lib_name in all_lib_names:
         try:
             _ngtcp2_crypto_lib = CDLL(lib_name)
@@ -169,13 +223,25 @@ def _load_ngtcp2_crypto_library():
             try:
                 # Check for OpenSSL backend
                 if 'ossl' in lib_name or 'quictls' in lib_name:
+                    if require_wolfssl:
+                        _ngtcp2_crypto_lib = None
+                        continue
                     _ngtcp2_crypto_lib.ngtcp2_crypto_ossl_init
                     NGTCP2_CRYPTO_AVAILABLE = True
                     USE_OPENSSL = True  # Set USE_OPENSSL when we find ossl library
-                    logger.info(f"Loaded ngtcp2 crypto (OpenSSL) library: {lib_name}")
+                    if wolfssl_tried:
+                        logger.info(
+                            "Loaded ngtcp2 crypto (OpenSSL) library: %s (WolfSSL not found; "
+                            "build server with scripts/build-wolfssl-ngtcp2.sh and set LD_LIBRARY_PATH=/usr/local/lib64 or /usr/local/lib to match client)",
+                            lib_name,
+                        )
+                    else:
+                        logger.info(f"Loaded ngtcp2 crypto (OpenSSL) library: {lib_name}")
                     return True
                 elif 'wolfssl' in lib_name:
-                    _ngtcp2_crypto_lib.ngtcp2_crypto_wolfssl_init
+                    # Newer ngtcp2 may not export ngtcp2_crypto_wolfssl_init; detect by any wolfssl symbol
+                    if getattr(_ngtcp2_crypto_lib, 'ngtcp2_crypto_wolfssl_configure_server_context', None) is None:
+                        raise AttributeError("wolfssl backend missing required symbol")
                     NGTCP2_CRYPTO_AVAILABLE = True
                     USE_WOLFSSL = True  # Set USE_WOLFSSL when we find wolfssl library
                     logger.info(f"Loaded ngtcp2 crypto (wolfSSL) library: {lib_name}")
@@ -183,9 +249,32 @@ def _load_ngtcp2_crypto_library():
             except AttributeError:
                 _ngtcp2_crypto_lib = None
                 continue
-        except OSError:
+        except OSError as e:
+            if 'wolfssl' in lib_name:
+                wolfssl_tried = True
+                if first_wolfssl_load_error is None:
+                    first_wolfssl_load_error = (lib_name, e)
             continue
-    
+
+    if require_wolfssl:
+        if first_wolfssl_load_error:
+            logger.error(
+                "Load failed for %s: %s",
+                first_wolfssl_load_error[0],
+                first_wolfssl_load_error[1],
+            )
+        logger.error(
+            "MQTTD_QUIC_USE_WOLFSSL=1 but libngtcp2_crypto_wolfssl not found. "
+            "Run scripts/build-wolfssl-ngtcp2.sh (from mqttd root). "
+            "If installed under a prefix, set before running: "
+            "export LD_LIBRARY_PATH=$HOME/.local/lib64:$HOME/.local/lib  (or /usr/local/lib64:/usr/local/lib)"
+        )
+    elif wolfssl_tried:
+        logger.warning(
+            "libngtcp2_crypto_wolfssl not found; using OpenSSL. "
+            "To match capacitor-mqtt-quic client: run scripts/build-wolfssl-ngtcp2.sh on this server, "
+            "then LD_LIBRARY_PATH=/usr/local/lib64 (or /usr/local/lib) when starting the server."
+        )
     NGTCP2_CRYPTO_AVAILABLE = False
     logger.warning("ngtcp2 crypto library not found")
     return False
@@ -704,8 +793,10 @@ def init_tls_backend() -> bool:
                 logger.error(f"Error calling ngtcp2_crypto_wolfssl_init: {e}")
                 return False
         else:
-            logger.debug("init_tls_backend: USE_WOLFSSL=True but ngtcp2_crypto_wolfssl_init is None")
-    
+            # Newer ngtcp2_crypto_wolfssl may not export ngtcp2_crypto_wolfssl_init; backend is still usable
+            logger.info("Using ngtcp2 crypto (wolfSSL) backend (no init required)")
+            return True
+
     logger.warning(f"No TLS backend available for ngtcp2 (USE_OPENSSL={USE_OPENSSL}, USE_WOLFSSL={USE_WOLFSSL}, ossl_init={ngtcp2_crypto_ossl_init is not None}, wolfssl_init={ngtcp2_crypto_wolfssl_init is not None})")
     return False
 
@@ -735,12 +826,142 @@ def verify_tls_bindings() -> bool:
 # Global server TLS context (shared across all connections; OpenSSL 3.x implements TLS 1.3)
 _server_tls_ctx = None
 
+# wolfSSL server context creation (lazy-bound when USE_WOLFSSL)
+wolfSSL_CTX_new = None
+wolfSSL_CTX_free = None
+wolfTLSv1_3_server_method = None
+wolfSSL_CTX_use_certificate_file = None
+wolfSSL_CTX_use_PrivateKey_file = None
+ngtcp2_crypto_wolfssl_configure_server_context = None
+wolfSSL_new = None
+wolfSSL_free = None
+wolfSSL_set_accept_state = None
+wolfSSL_set_ex_data = None
+wolfSSL_set_app_data = None  # ngtcp2 requires this for conn_ref (add_handshake_data uses SSL_get_app_data)
+wolfSSL_set_quic_transport_version = None  # required so WolfSSL uses quic_method (add_handshake_data etc)
+wolfSSL_Debugging_ON = None  # optional: enable WolfSSL debug to stderr when MQTTD_WOLFSSL_DEBUG=1
+wolfSSL_CTX_set_alpn_select_cb = None  # ALPN selection callback (server)
+
+# ALPN configuration (client expects "mqtt")
+_ALPN_PROTO = b"mqtt"
+_ALPN_BUF = (c_ubyte * len(_ALPN_PROTO))(*_ALPN_PROTO)
+_ALPN_SELECT_CB = None
+
+# PEM file type for wolfSSL (match OpenSSL SSL_FILETYPE_PEM = 1)
+# QUIC v1 version (0x39) - must set on session so WolfSSL treats it as QUIC
+WOLFSSL_QUIC_TRANSPORT_VERSION_V1 = 0x39
+WOLFSSL_FILETYPE_PEM = 1
+
+
+def _ensure_wolfssl_bound():
+    """Ensure wolfSSL context-creation and ngtcp2_crypto_wolfssl_configure_server_context are bound."""
+    global wolfSSL_CTX_new, wolfSSL_CTX_free, wolfTLSv1_3_server_method
+    global wolfSSL_CTX_use_certificate_file, wolfSSL_CTX_use_PrivateKey_file
+    global ngtcp2_crypto_wolfssl_configure_server_context
+    global wolfSSL_new, wolfSSL_free, wolfSSL_set_accept_state, wolfSSL_set_ex_data, wolfSSL_set_app_data
+    global wolfSSL_set_quic_transport_version, wolfSSL_CTX_set_alpn_select_cb
+    global wolfSSL_Debugging_ON
+    if ngtcp2_crypto_wolfssl_configure_server_context is not None and wolfSSL_CTX_new is not None:
+        return
+    _prepend_ld_library_path()
+    _load_wolfssl_library()
+    if not WOLFSSL_AVAILABLE or _wolfssl_lib is None:
+        return
+    w = _wolfssl_lib
+    try:
+        wolfTLSv1_3_server_method = w.wolfTLSv1_3_server_method
+        wolfTLSv1_3_server_method.argtypes = []
+        wolfTLSv1_3_server_method.restype = c_void_p
+    except AttributeError:
+        pass
+    try:
+        wolfSSL_CTX_new = w.wolfSSL_CTX_new
+        wolfSSL_CTX_new.argtypes = [c_void_p]
+        wolfSSL_CTX_new.restype = c_void_p
+    except AttributeError:
+        pass
+    try:
+        wolfSSL_CTX_free = w.wolfSSL_CTX_free
+        wolfSSL_CTX_free.argtypes = [c_void_p]
+        wolfSSL_CTX_free.restype = None
+    except AttributeError:
+        pass
+    try:
+        wolfSSL_CTX_use_certificate_file = w.wolfSSL_CTX_use_certificate_file
+        wolfSSL_CTX_use_certificate_file.argtypes = [c_void_p, c_char_p, c_int]
+        wolfSSL_CTX_use_certificate_file.restype = c_int
+    except AttributeError:
+        pass
+    try:
+        wolfSSL_CTX_use_PrivateKey_file = w.wolfSSL_CTX_use_PrivateKey_file
+        wolfSSL_CTX_use_PrivateKey_file.argtypes = [c_void_p, c_char_p, c_int]
+        wolfSSL_CTX_use_PrivateKey_file.restype = c_int
+    except AttributeError:
+        pass
+    try:
+        wolfSSL_new = w.wolfSSL_new
+        wolfSSL_new.argtypes = [c_void_p]
+        wolfSSL_new.restype = c_void_p
+    except AttributeError:
+        pass
+    try:
+        wolfSSL_free = w.wolfSSL_free
+        wolfSSL_free.argtypes = [c_void_p]
+        wolfSSL_free.restype = None
+    except AttributeError:
+        pass
+    try:
+        wolfSSL_set_accept_state = w.wolfSSL_set_accept_state
+        wolfSSL_set_accept_state.argtypes = [c_void_p]
+        wolfSSL_set_accept_state.restype = None
+    except AttributeError:
+        pass
+    try:
+        wolfSSL_set_ex_data = w.wolfSSL_set_ex_data
+        wolfSSL_set_ex_data.argtypes = [c_void_p, c_int, c_void_p]
+        wolfSSL_set_ex_data.restype = c_int
+    except AttributeError:
+        pass
+    try:
+        wolfSSL_set_app_data = w.wolfSSL_set_app_data
+        wolfSSL_set_app_data.argtypes = [c_void_p, c_void_p]
+        wolfSSL_set_app_data.restype = c_int
+    except AttributeError:
+        wolfSSL_set_app_data = None
+    try:
+        wolfSSL_set_quic_transport_version = w.wolfSSL_set_quic_transport_version
+        wolfSSL_set_quic_transport_version.argtypes = [c_void_p, c_int]
+        wolfSSL_set_quic_transport_version.restype = None
+    except AttributeError:
+        wolfSSL_set_quic_transport_version = None
+    try:
+        wolfSSL_CTX_set_alpn_select_cb = w.wolfSSL_CTX_set_alpn_select_cb
+        wolfSSL_CTX_set_alpn_select_cb.argtypes = [c_void_p, c_void_p]
+        wolfSSL_CTX_set_alpn_select_cb.restype = None
+    except AttributeError:
+        wolfSSL_CTX_set_alpn_select_cb = None
+    try:
+        wolfSSL_Debugging_ON = w.wolfSSL_Debugging_ON
+        wolfSSL_Debugging_ON.argtypes = []
+        wolfSSL_Debugging_ON.restype = None
+    except AttributeError:
+        wolfSSL_Debugging_ON = None
+    if _ngtcp2_crypto_lib:
+        try:
+            f = getattr(_ngtcp2_crypto_lib, 'ngtcp2_crypto_wolfssl_configure_server_context', None)
+            if f:
+                ngtcp2_crypto_wolfssl_configure_server_context = f
+                ngtcp2_crypto_wolfssl_configure_server_context.argtypes = [c_void_p]
+                ngtcp2_crypto_wolfssl_configure_server_context.restype = c_int
+        except Exception:
+            pass
+
 
 def _ensure_openssl_bound():
     """Ensure OpenSSL functions are bound - called lazily"""
     global TLS_server_method, SSL_CTX_new, SSL_CTX_free
     global SSL_CTX_use_certificate_file, SSL_CTX_use_PrivateKey_file
-    global SSL_CTX_set_min_proto_version
+    global SSL_CTX_set_min_proto_version, SSL_CTX_set_alpn_select_cb
     global SSL_new, SSL_free, SSL_set_accept_state
     global SSL_set_app_data, SSL_get_app_data
     global ngtcp2_crypto_ossl_configure_server_session
@@ -801,6 +1022,12 @@ def _ensure_openssl_bound():
         SSL_CTX_set_min_proto_version.restype = c_int
     except AttributeError:
         pass
+    try:
+        SSL_CTX_set_alpn_select_cb = ssl_lib.SSL_CTX_set_alpn_select_cb
+        SSL_CTX_set_alpn_select_cb.argtypes = [c_void_p, c_void_p, c_void_p]
+        SSL_CTX_set_alpn_select_cb.restype = None
+    except AttributeError:
+        SSL_CTX_set_alpn_select_cb = None
     
     try:
         SSL_new = ssl_lib.SSL_new
@@ -875,18 +1102,92 @@ def _ensure_openssl_bound():
 
 def create_server_tls_ctx(cert_file: str, key_file: str) -> Optional[c_void_p]:
     """
-    Create and configure a TLS context for QUIC server (via OpenSSL SSL_CTX).
+    Create and configure a TLS context for QUIC server (OpenSSL SSL_CTX or wolfSSL WOLFSSL_CTX).
     
     Args:
         cert_file: Path to certificate file (PEM format)
         key_file: Path to private key file (PEM format)
     
     Returns:
-        TLS context handle (OpenSSL SSL_CTX*) or None on failure
+        TLS context handle (SSL_CTX* or WOLFSSL_CTX*) or None on failure
     """
-    global _server_tls_ctx
+    global _server_tls_ctx, _ALPN_SELECT_CB
     
-    # Ensure OpenSSL functions are bound (lazy binding)
+    # wolfSSL path when USE_WOLFSSL
+    if USE_WOLFSSL:
+        _ensure_wolfssl_bound()
+        if os.environ.get("MQTTD_WOLFSSL_DEBUG") and wolfSSL_Debugging_ON:
+            try:
+                wolfSSL_Debugging_ON()
+                logger.info("WolfSSL debugging enabled (MQTTD_WOLFSSL_DEBUG=1)")
+            except Exception:
+                pass
+        if (
+            wolfSSL_CTX_new and wolfTLSv1_3_server_method
+            and wolfSSL_CTX_use_certificate_file and wolfSSL_CTX_use_PrivateKey_file
+            and ngtcp2_crypto_wolfssl_configure_server_context
+        ):
+            try:
+                method = wolfTLSv1_3_server_method()
+                if not method:
+                    logger.error("wolfTLSv1_3_server_method() returned NULL")
+                    return None
+                ctx = wolfSSL_CTX_new(method)
+                if not ctx:
+                    logger.error("wolfSSL_CTX_new() returned NULL")
+                    return None
+                r = wolfSSL_CTX_use_certificate_file(ctx, cert_file.encode(), WOLFSSL_FILETYPE_PEM)
+                if r != 1:
+                    logger.error(f"Failed to load certificate from {cert_file}")
+                    if wolfSSL_CTX_free:
+                        wolfSSL_CTX_free(ctx)
+                    return None
+                r = wolfSSL_CTX_use_PrivateKey_file(ctx, key_file.encode(), WOLFSSL_FILETYPE_PEM)
+                if r != 1:
+                    logger.error(f"Failed to load private key from {key_file}")
+                    if wolfSSL_CTX_free:
+                        wolfSSL_CTX_free(ctx)
+                    return None
+                result = ngtcp2_crypto_wolfssl_configure_server_context(ctx)
+                if result != 0:
+                    logger.error(f"ngtcp2_crypto_wolfssl_configure_server_context failed: {result}")
+                    if wolfSSL_CTX_free:
+                        wolfSSL_CTX_free(ctx)
+                    return None
+                # Configure ALPN: select "mqtt" when offered by client
+                if wolfSSL_CTX_set_alpn_select_cb:
+                    if _ALPN_SELECT_CB is None:
+                        @CFUNCTYPE(c_int, c_void_p, POINTER(POINTER(c_ubyte)), POINTER(c_ubyte), POINTER(c_ubyte), c_uint, c_void_p)
+                        def _alpn_select_cb(ssl, out, outlen, in_buf, inlen, arg):
+                            data = ctypes.string_at(in_buf, inlen)
+                            i = 0
+                            while i + 1 <= len(data):
+                                ln = data[i]
+                                i += 1
+                                if i + ln > len(data):
+                                    break
+                                if data[i:i+ln] == _ALPN_PROTO:
+                                    out[0] = ctypes.cast(_ALPN_BUF, POINTER(c_ubyte))
+                                    outlen[0] = len(_ALPN_PROTO)
+                                    return 0
+                                i += ln
+                            return 1
+                        _ALPN_SELECT_CB = _alpn_select_cb
+                    wolfSSL_CTX_set_alpn_select_cb(ctx, ctypes.cast(_ALPN_SELECT_CB, c_void_p))
+                    logger.info("Configured ALPN selection for wolfSSL: mqtt")
+                _server_tls_ctx = ctx
+                logger.info("Created server TLS context (wolfSSL) successfully")
+                return ctx
+            except Exception as e:
+                logger.error(f"Error creating wolfSSL TLS context: {e}")
+                return None
+        if not WOLFSSL_AVAILABLE:
+            logger.error("wolfSSL not available for TLS context creation (install libwolfssl and set LD_LIBRARY_PATH)")
+        else:
+            logger.error("wolfSSL server context helpers not available (missing wolfTLSv1_3_server_method or ngtcp2_crypto_wolfssl_configure_server_context)")
+        return None
+    
+    # OpenSSL path
     _ensure_openssl_bound()
     
     if not USE_OPENSSL or not OPENSSL_AVAILABLE:
@@ -930,6 +1231,28 @@ def create_server_tls_ctx(cert_file: str, key_file: str) -> Optional[c_void_p]:
         # Set minimum TLS version to 1.3 (required for QUIC)
         if SSL_CTX_set_min_proto_version:
             SSL_CTX_set_min_proto_version(ctx, TLS1_3_VERSION)
+
+        # Configure ALPN: select "mqtt" when offered by client
+        if SSL_CTX_set_alpn_select_cb:
+            if _ALPN_SELECT_CB is None:
+                @CFUNCTYPE(c_int, c_void_p, POINTER(POINTER(c_ubyte)), POINTER(c_ubyte), POINTER(c_ubyte), c_uint, c_void_p)
+                def _alpn_select_cb(ssl, out, outlen, in_buf, inlen, arg):
+                    data = ctypes.string_at(in_buf, inlen)
+                    i = 0
+                    while i + 1 <= len(data):
+                        ln = data[i]
+                        i += 1
+                        if i + ln > len(data):
+                            break
+                        if data[i:i+ln] == _ALPN_PROTO:
+                            out[0] = ctypes.cast(_ALPN_BUF, POINTER(c_ubyte))
+                            outlen[0] = len(_ALPN_PROTO)
+                            return 0
+                        i += ln
+                    return 1
+                _ALPN_SELECT_CB = _alpn_select_cb
+            SSL_CTX_set_alpn_select_cb(ctx, ctypes.cast(_ALPN_SELECT_CB, c_void_p), None)
+            logger.info("Configured ALPN selection for OpenSSL: mqtt")
         
         _server_tls_ctx = ctx
         logger.info("Created server TLS context successfully")
@@ -947,22 +1270,47 @@ create_server_ssl_ctx = create_server_tls_ctx
 def create_server_tls_session(tls_ctx: Optional[c_void_p] = None) -> Optional[c_void_p]:
     """
     Create a TLS session for a new QUIC connection.
-    Uses libngtcp2_crypto_ossl's crypto_ossl_ctx (tls_native_handle must be this, not raw SSL*).
+    OpenSSL: returns crypto_ossl_ctx*. WolfSSL: returns WOLFSSL*.
     
     Args:
         tls_ctx: TLS context to use (uses global if None)
     
     Returns:
-        crypto_ossl_ctx* (to pass to ngtcp2_conn_set_tls_native_handle) or None on failure.
-        Use ngtcp2_crypto_ossl_ctx_get_ssl(ossl_ctx) to get SSL* for SSL_set_app_data.
+        Session handle for ngtcp2_conn_set_tls_native_handle, or None on failure.
     """
-    # Ensure OpenSSL functions are bound (lazy binding)
-    _ensure_openssl_bound()
-    
     ctx = tls_ctx or _server_tls_ctx
     if not ctx:
         logger.error("No TLS context available")
         return None
+    
+    # wolfSSL path
+    if USE_WOLFSSL:
+        _ensure_wolfssl_bound()
+        if wolfSSL_new and wolfSSL_set_accept_state:
+            try:
+                ssl = wolfSSL_new(ctx)
+                if not ssl:
+                    logger.error("wolfSSL_new() returned NULL")
+                    return None
+                wolfSSL_set_accept_state(ssl)
+                # Required so WolfSSL uses quic_method (add_handshake_data etc); see ngtcp2 tls_server_session_wolfssl.cc
+                if wolfSSL_set_quic_transport_version:
+                    wolfSSL_set_quic_transport_version(ssl, WOLFSSL_QUIC_TRANSPORT_VERSION_V1)
+                    logger.info("Set WolfSSL session to QUIC v1 (required for add_handshake_data)")
+                else:
+                    logger.warning(
+                        "wolfSSL_set_quic_transport_version not found; rebuild WolfSSL with --enable-quic. "
+                        "Handshake will not complete."
+                    )
+                logger.debug("Created WOLFSSL session for QUIC server")
+                return ssl
+            except Exception as e:
+                logger.error(f"Error creating wolfSSL session: {e}")
+                return None
+        return None
+    
+    # OpenSSL path
+    _ensure_openssl_bound()
     
     if not SSL_new:
         logger.error("OpenSSL SSL_new not available")
@@ -1019,8 +1367,16 @@ create_server_ssl_session = create_server_tls_session
 
 
 def free_tls_session(session: c_void_p) -> None:
-    """Free a TLS session. If created via ossl_ctx API, session is crypto_ossl_ctx*; else SSL*."""
+    """Free a TLS session. OpenSSL: crypto_ossl_ctx* or SSL*. WolfSSL: WOLFSSL*."""
     if not session:
+        return
+    if USE_WOLFSSL:
+        _ensure_wolfssl_bound()
+        if wolfSSL_free:
+            try:
+                wolfSSL_free(session)
+            except Exception:
+                pass
         return
     if ngtcp2_crypto_ossl_ctx_del:
         try:

@@ -121,31 +121,35 @@ class ngtcp2_vec(Structure):
     ]
 
 
-# Path storage structure (simplified)
-class ngtcp2_path(Structure):
-    """Path information (simplified version)"""
-    _fields_ = [
-        ("local_addr", c_void_p),  # sockaddr pointer
-        ("local_addrlen", c_size_t),
-        ("remote_addr", c_void_p),  # sockaddr pointer
-        ("remote_addrlen", c_size_t),
-    ]
-
-
-class ngtcp2_path_storage(Structure):
-    """Path storage (for path management)"""
-    _fields_ = [
-        ("ps", ngtcp2_path),
-        ("_dummy", c_uint8 * 256),  # Padding
-    ]
-
-
-# Address structure (simplified)
+# Path storage structure - matches ngtcp2.h exactly
 class ngtcp2_addr(Structure):
-    """Address structure (opaque for now)"""
+    """Address structure - pointer to sockaddr + length"""
     _fields_ = [
         ("addr", c_void_p),  # sockaddr pointer
         ("addrlen", c_size_t),
+    ]
+
+
+class ngtcp2_path(Structure):
+    """Network path - local and remote addresses"""
+    _fields_ = [
+        ("local", ngtcp2_addr),
+        ("remote", ngtcp2_addr),
+        ("user_data", c_void_p),
+    ]
+
+
+class ngtcp2_sockaddr_union(Structure):
+    """Union for sockaddr storage (128 bytes per ngtcp2.h)"""
+    _fields_ = [("data", c_uint8 * 128)]
+
+
+class ngtcp2_path_storage(Structure):
+    """Path storage with embedded sockaddr buffers"""
+    _fields_ = [
+        ("path", ngtcp2_path),
+        ("local_addrbuf", ngtcp2_sockaddr_union),
+        ("remote_addrbuf", ngtcp2_sockaddr_union),
     ]
 
 
@@ -201,8 +205,8 @@ class ngtcp2_settings(Structure):
 
 # Socket address structures for ngtcp2_preferred_addr
 class ngtcp2_in_addr(Structure):
-    """IPv4 address (4 bytes)"""
-    _fields_ = [("s_addr", c_uint32)]
+    """IPv4 address (4 bytes) - stored as bytes in network byte order"""
+    _fields_ = [("s_addr", c_uint8 * 4)]
 
 
 class ngtcp2_sockaddr_in(Structure):
@@ -418,6 +422,9 @@ RecvPacketFunc = CFUNCTYPE(
 
 # Load ngtcp2 library
 _ngtcp2_lib = None
+
+# Forward declare functions that will be bound later
+ngtcp2_path_storage_init = None
 NGTCP2_AVAILABLE = False
 
 def _load_ngtcp2_library():
@@ -602,6 +609,23 @@ if NGTCP2_AVAILABLE and _ngtcp2_lib:
                 p.max_ack_delay = NGTCP2_DEFAULT_MAX_ACK_DELAY
         ngtcp2_transport_params_default = _transport_params_default_wrapper
     
+    # Path storage initialization
+    try:
+        ngtcp2_path_storage_init = lib.ngtcp2_path_storage_init
+        ngtcp2_path_storage_init.argtypes = [
+            POINTER(ngtcp2_path_storage),  # ps
+            c_void_p,  # local_addr (ngtcp2_sockaddr*)
+            c_size_t,  # local_addrlen
+            c_void_p,  # remote_addr (ngtcp2_sockaddr*)
+            c_size_t,  # remote_addrlen
+            c_void_p,  # user_data
+        ]
+        ngtcp2_path_storage_init.restype = None
+        logger.debug("ngtcp2_path_storage_init bound successfully")
+    except AttributeError:
+        ngtcp2_path_storage_init = None
+        logger.warning("ngtcp2_path_storage_init function not found")
+    
     # Connection management - Server (try versioned first)
     ngtcp2_conn_server_new = None
     try:
@@ -724,7 +748,7 @@ if NGTCP2_AVAILABLE and _ngtcp2_lib:
         logger.warning("ngtcp2_conn_read_pkt function not found")
     
     # Connection management - Write packets (try versioned first)
-    # Versioned API: ngtcp2_conn_write_pkt_versioned(conn, path, pkt_info_version, pi, dest, destlen, pdatalen, ts)
+    # Versioned API: ngtcp2_conn_write_pkt_versioned(conn, path, pkt_info_version, pi, dest, destlen, ts) -> ngtcp2_ssize (no pdatalen in C)
     # Non-versioned: ngtcp2_conn_write_pkt(conn, path, pi, dest, destlen, ts) -> ngtcp2_ssize (bytes written)
     _write_pkt_versioned_c = None
     _write_pkt_fallback_c = None
@@ -737,8 +761,7 @@ if NGTCP2_AVAILABLE and _ngtcp2_lib:
             c_void_p,  # ngtcp2_pkt_info *pi (can be NULL)
             POINTER(c_uint8),  # dest (output buffer)
             c_size_t,  # destlen (buffer size)
-            POINTER(c_size_t),  # pdatalen (bytes written out)
-            c_uint64,  # ts (timestamp)
+            c_uint64,  # ts (timestamp) - C API has 7 args total; return value is bytes written
         ]
         _write_pkt_versioned_c.restype = c_ssize_t  # ngtcp2_ssize: bytes written or error
         logger.debug("Using ngtcp2_conn_write_pkt_versioned")
@@ -763,7 +786,13 @@ if NGTCP2_AVAILABLE and _ngtcp2_lib:
     def ngtcp2_conn_write_pkt(conn, path, dest, destlen, pdatalen, ts):
         """Unified write: (conn, path, dest, destlen, pdatalen, ts). pdatalen is c_size_t byref; ts must be monotonic."""
         if _write_pkt_versioned_c is not None:
-            return _write_pkt_versioned_c(conn, path, NGTCP2_PKT_INFO_V1, None, dest, destlen, pdatalen, ts)
+            r = _write_pkt_versioned_c(conn, path, NGTCP2_PKT_INFO_V1, None, dest, destlen, ts)
+            if r >= 0 and pdatalen is not None:
+                try:
+                    pdatalen.contents = r
+                except Exception:
+                    pass
+            return r
         if _write_pkt_fallback_c is not None:
             r = _write_pkt_fallback_c(conn, path, None, dest, destlen, ts)
             if r >= 0 and pdatalen is not None:
@@ -775,14 +804,12 @@ if NGTCP2_AVAILABLE and _ngtcp2_lib:
         return -1
     
     # Connection management - Handle expiry
+    # C API: int ngtcp2_conn_handle_expiry(ngtcp2_conn *conn, ngtcp2_tstamp ts);
     try:
         ngtcp2_conn_handle_expiry = lib.ngtcp2_conn_handle_expiry
         ngtcp2_conn_handle_expiry.argtypes = [
             POINTER(ngtcp2_conn),  # conn
-            POINTER(ngtcp2_path),  # path
             c_uint64,  # ts (timestamp)
-            c_void_p,  # user_data
-            POINTER(SendPacketFunc),  # send_pkt callback
         ]
         ngtcp2_conn_handle_expiry.restype = c_int  # 0 on success
     except AttributeError:
@@ -874,74 +901,50 @@ if NGTCP2_AVAILABLE and _ngtcp2_lib:
         # This is OK - stream data comes through callbacks in newer API
         logger.debug("ngtcp2_strm_recv not available (using callbacks instead)")
     
+    # Stream management - Submit stream data (queue for send)
+    ngtcp2_conn_submit_stream_data = None
+    try:
+        ngtcp2_conn_submit_stream_data = lib.ngtcp2_conn_submit_stream_data
+        ngtcp2_conn_submit_stream_data.argtypes = [
+            ngtcp2_conn,  # conn
+            c_uint32,  # flags (e.g., NGTCP2_STREAM_DATA_FLAG_FIN)
+            c_int64,  # stream_id
+            POINTER(c_uint8),  # data
+            c_size_t,  # datalen
+        ]
+        ngtcp2_conn_submit_stream_data.restype = c_int
+        logger.debug("Loaded ngtcp2_conn_submit_stream_data")
+    except AttributeError:
+        ngtcp2_conn_submit_stream_data = None
+        logger.debug("ngtcp2_conn_submit_stream_data not available")
+    
     # Stream management - Write stream data
-    # Use ngtcp2_conn_writev_stream_versioned (the actual function name)
+    # Use ngtcp2_conn_writev_stream_versioned (actual exported symbol)
+    ngtcp2_conn_writev_stream_versioned = None
+    ngtcp2_conn_writev_stream = None
     ngtcp2_strm_write = None
     try:
-        # Try versioned function first
+        # Versioned function signature (ngtcp2.h)
         ngtcp2_conn_writev_stream_versioned = lib.ngtcp2_conn_writev_stream_versioned
         ngtcp2_conn_writev_stream_versioned.argtypes = [
             ngtcp2_conn,  # conn
+            POINTER(ngtcp2_path),  # path
+            c_int,  # pkt_info_version
+            POINTER(ngtcp2_pkt_info),  # pi (can be NULL)
+            POINTER(c_uint8),  # dest
+            c_size_t,  # destlen
+            POINTER(c_ssize_t),  # pdatalen (bytes of stream data consumed)
+            c_uint32,  # flags
             c_int64,  # stream_id
-            POINTER(ngtcp2_vec),  # vec (iovec array)
-            c_size_t,  # veccnt (number of iovecs)
-            c_uint32,  # fin (1 to set FIN bit)
+            POINTER(ngtcp2_vec),  # datav
+            c_size_t,  # datavcnt
             c_uint64,  # ts (timestamp)
-            c_void_p,  # user_data
-            POINTER(SendPacketFunc),  # send_pkt callback
         ]
         ngtcp2_conn_writev_stream_versioned.restype = c_ssize_t  # bytes written or error
-        
-        # Create wrapper for easier use (single buffer instead of iovec)
-        def _strm_write_wrapper(conn, stream_id, data, datalen, fin):
-            """Wrapper for ngtcp2_conn_writev_stream_versioned with single buffer"""
-            # Create iovec structure
-            vec = ngtcp2_vec()
-            # data should be a pointer to uint8 array or bytes
-            if isinstance(data, (bytes, bytearray)):
-                # Convert bytes to c_uint8 array
-                data_array = (c_uint8 * datalen).from_buffer_copy(data)
-                vec.base = cast(data_array, POINTER(c_uint8))
-            else:
-                # Assume it's already a pointer
-                vec.base = cast(data, POINTER(c_uint8))
-            vec.len = datalen
-            
-            # Call versioned function
-            result = ngtcp2_conn_writev_stream_versioned(
-                conn,
-                stream_id,
-                byref(vec),
-                1,  # veccnt
-                fin,
-                int(time.time() * NGTCP2_SECONDS),  # ts
-                None,  # user_data
-                None,  # send_pkt callback (handled separately)
-            )
-            return int(result)  # Convert ssize_t to int
-        
-        ngtcp2_strm_write = _strm_write_wrapper
         logger.debug("Using ngtcp2_conn_writev_stream_versioned")
     except AttributeError:
-        try:
-            # Try non-versioned function
-            ngtcp2_conn_writev_stream = lib.ngtcp2_conn_writev_stream
-            ngtcp2_conn_writev_stream.argtypes = [
-                ngtcp2_conn,
-                c_int64,
-                POINTER(ngtcp2_vec),
-                c_size_t,
-                c_uint32,
-                c_uint64,
-                c_void_p,
-                POINTER(SendPacketFunc),
-            ]
-            ngtcp2_conn_writev_stream.restype = c_ssize_t
-            ngtcp2_strm_write = ngtcp2_conn_writev_stream
-            logger.debug("Using ngtcp2_conn_writev_stream")
-        except AttributeError:
-            ngtcp2_strm_write = None
-            logger.warning("ngtcp2_strm_write function not found")
+        ngtcp2_conn_writev_stream_versioned = None
+        logger.warning("ngtcp2_conn_writev_stream_versioned not found")
     
     # Stream management - Shutdown stream
     # Use ngtcp2_conn_shutdown_stream (the actual function name)
@@ -973,6 +976,33 @@ if NGTCP2_AVAILABLE and _ngtcp2_lib:
         ngtcp2_conn_get_remote_transport_params.restype = POINTER(ngtcp2_transport_params)
     except AttributeError:
         ngtcp2_conn_get_remote_transport_params = None
+    
+    # Get current path from connection
+    try:
+        ngtcp2_conn_get_path = lib.ngtcp2_conn_get_path
+        ngtcp2_conn_get_path.argtypes = [POINTER(ngtcp2_conn)]
+        ngtcp2_conn_get_path.restype = POINTER(ngtcp2_path)
+    except AttributeError:
+        ngtcp2_conn_get_path = None
+    
+    # Load wrapper library for amplification limit workaround
+    ngtcp2_conn_force_validate_path = None
+    ngtcp2_path_is_local_network = None
+    try:
+        import os
+        wrapper_path = os.path.join(os.path.dirname(__file__), "libngtcp2_wrapper.so")
+        if os.path.exists(wrapper_path):
+            wrapper_lib = ctypes.CDLL(wrapper_path)
+            ngtcp2_conn_force_validate_path = wrapper_lib.ngtcp2_conn_force_validate_path
+            ngtcp2_conn_force_validate_path.argtypes = [POINTER(ngtcp2_conn)]
+            ngtcp2_conn_force_validate_path.restype = c_int
+            
+            ngtcp2_path_is_local_network = wrapper_lib.ngtcp2_path_is_local_network
+            ngtcp2_path_is_local_network.argtypes = [POINTER(ngtcp2_path)]
+            ngtcp2_path_is_local_network.restype = c_int
+            logger.info("Loaded ngtcp2_wrapper library (amplification limit workaround)")
+    except Exception as e:
+        logger.debug(f"ngtcp2_wrapper not available: {e}")
     
     try:
         ngtcp2_conn_set_keep_alive_timeout = lib.ngtcp2_conn_set_keep_alive_timeout
@@ -1042,6 +1072,13 @@ if NGTCP2_AVAILABLE and _ngtcp2_lib:
         ngtcp2_conn_get_expiry.restype = c_uint64  # ngtcp2_tstamp
     except AttributeError:
         ngtcp2_conn_get_expiry = None
+
+    try:
+        ngtcp2_conn_get_timestamp = lib.ngtcp2_conn_get_timestamp
+        ngtcp2_conn_get_timestamp.argtypes = [POINTER(ngtcp2_conn)]
+        ngtcp2_conn_get_timestamp.restype = c_uint64  # ngtcp2_tstamp (conn->log.last_ts)
+    except AttributeError:
+        ngtcp2_conn_get_timestamp = None
     
     try:
         ngtcp2_conn_get_handshake_completed = lib.ngtcp2_conn_get_handshake_completed
@@ -1069,6 +1106,7 @@ else:
     ngtcp2_version = None
     ngtcp2_settings_default = None
     ngtcp2_transport_params_default = None
+    ngtcp2_path_storage_init = None
     ngtcp2_conn_server_new = None
     ngtcp2_accept = None
     ngtcp2_conn_read_pkt = None
@@ -1087,6 +1125,7 @@ else:
     ngtcp2_conn_get_stream_user_data = None
     ngtcp2_conn_set_stream_user_data = None
     ngtcp2_conn_get_expiry = None
+    ngtcp2_conn_get_timestamp = None
     ngtcp2_conn_get_handshake_completed = None
     ngtcp2_conn_set_tls_native_handle = None
     ngtcp2_conn_del = None
