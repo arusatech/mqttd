@@ -1112,9 +1112,12 @@ class MQTTApp:
                 return
             
             # Main message loop
-            # Use keepalive timeout (with buffer) or default 60 seconds
+            # Use keepalive timeout (with buffer) for TCP. For QUIC (non-socket),
+            # don't apply a read timeout; QUIC keep-alive runs at transport level.
             keepalive_timeout = 60.0
-            if client_sock in self._client_keepalive:
+            if not isinstance(client_sock, socket.socket):
+                keepalive_timeout = None
+            elif client_sock in self._client_keepalive:
                 keepalive_seconds = self._client_keepalive[client_sock][1]
                 # Timeout at 1.5x keepalive to allow for network delay
                 keepalive_timeout = (keepalive_seconds * 1.5) if keepalive_seconds > 0 else 60.0

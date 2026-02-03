@@ -691,16 +691,26 @@ class NGTCP2Connection:
                     return 0
                 stream = conn_obj.get_stream(stream_id)
                 if datalen:
+                    offset_val = int(offset)
+                    end_offset = offset_val + int(datalen)
+                    # Drop fully duplicated data (retransmissions)
+                    if end_offset <= stream.rx_offset:
+                        if flags & NGTCP2_STREAM_DATA_FLAG_FIN:
+                            stream.state = "closed"
+                        return 0
                     payload = ctypes.string_at(data, datalen)
-                    stream.append_data(payload, fin=bool(flags & NGTCP2_STREAM_DATA_FLAG_FIN))
-                    if not getattr(conn_obj, "_logged_first_stream", False):
-                        conn_obj._logged_first_stream = True
-        # logger.info("Received stream data: stream_id=%s len=%s", stream_id, datalen)
-                    # Update flow control windows so peer can continue sending
-                    if ngtcp2_conn_extend_max_stream_offset:
-                        ngtcp2_conn_extend_max_stream_offset(conn_obj._conn_ptr, stream_id, datalen)
-                    if ngtcp2_conn_extend_max_offset:
-                        ngtcp2_conn_extend_max_offset(conn_obj._conn_ptr, datalen)
+                    if offset_val < stream.rx_offset:
+                        skip = stream.rx_offset - offset_val
+                        payload = payload[skip:]
+                    if payload:
+                        stream.append_data(payload, fin=bool(flags & NGTCP2_STREAM_DATA_FLAG_FIN))
+                        if not getattr(conn_obj, "_logged_first_stream", False):
+                            conn_obj._logged_first_stream = True
+                        # Update flow control windows only for new bytes
+                        if ngtcp2_conn_extend_max_stream_offset:
+                            ngtcp2_conn_extend_max_stream_offset(conn_obj._conn_ptr, stream_id, len(payload))
+                        if ngtcp2_conn_extend_max_offset:
+                            ngtcp2_conn_extend_max_offset(conn_obj._conn_ptr, len(payload))
             except Exception as e:
                 logger.debug("recv_stream_data_callback error: %s", e)
             return 0
