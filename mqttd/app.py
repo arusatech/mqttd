@@ -518,8 +518,8 @@ class MQTTApp:
             keepalive_seconds = client.keepalive if client.keepalive > 0 else 60
             self._client_keepalive[client_sock] = (asyncio.get_event_loop().time(), keepalive_seconds, None)
             
-            # Start keepalive monitoring task
-            if keepalive_seconds > 0:
+            # Start keepalive monitoring task (TCP only; QUIC keep-alive is handled at transport level)
+            if keepalive_seconds > 0 and isinstance(client_sock, socket.socket):
                 ping_task = asyncio.create_task(self._keepalive_monitor(client_sock, keepalive_seconds))
                 self._client_keepalive[client_sock] = (asyncio.get_event_loop().time(), keepalive_seconds, ping_task)
             
@@ -693,6 +693,33 @@ class MQTTApp:
         # Clean up disconnected clients
         for client_sock in disconnected_clients:
             await self._unsubscribe_client(client_sock)
+    
+    async def publish_to_client(self, client: MQTTClient, topic: str, payload: bytes,
+                                 qos: int = 0, retain: bool = False) -> bool:
+        """
+        Send a PUBLISH to a single client (e.g. to confirm "received").
+        Returns True if sent, False if client not found or send failed.
+        """
+        for client_sock, (stored_client, writer) in list(self._clients.items()):
+            if stored_client.client_id != client.client_id:
+                continue
+            try:
+                is_mqtt5 = hasattr(client, '_protocol_version') and client._protocol_version == MQTTProtocol.PROTOCOL_LEVEL_5_0
+                if is_mqtt5:
+                    publish_msg = MQTT5Protocol.build_publish_v5(
+                        topic=topic, payload=payload, packet_id=None, qos=qos, retain=retain
+                    )
+                else:
+                    publish_msg = MQTTProtocol.build_publish(topic, payload, None, qos, retain)
+                writer.write(publish_msg)
+                await writer.drain()
+                logger.debug(f"Sent to client {client.client_id} on topic: {topic}")
+                return True
+            except Exception as e:
+                logger.debug(f"Failed to send to client {client.client_id}: {e}")
+                return False
+        logger.debug(f"Client {client.client_id} not found for publish_to_client")
+        return False
     
     async def _handle_subscribe(self, reader: asyncio.StreamReader,
                                writer: asyncio.StreamWriter,
@@ -1409,6 +1436,8 @@ class MQTTApp:
     async def _keepalive_monitor(self, client_sock: socket.socket, keepalive_seconds: int):
         """Monitor client keepalive and disconnect if inactive"""
         try:
+            if not isinstance(client_sock, socket.socket):
+                return
             while self._running and client_sock in self._client_keepalive:
                 # Wait for keepalive interval + 50% buffer
                 await asyncio.sleep(keepalive_seconds * 1.5)

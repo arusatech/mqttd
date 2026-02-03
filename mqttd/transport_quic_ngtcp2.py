@@ -406,8 +406,11 @@ class NGTCP2Connection:
             self.transport_params.initial_max_stream_data_uni = self.settings.max_window
             self.transport_params.initial_max_streams_bidi = QUIC_MAX_STREAMS
             self.transport_params.initial_max_streams_uni = QUIC_MAX_STREAMS
-            # Use 30s idle timeout (ngtcp2 uses ns).
-            self.transport_params.max_idle_timeout = 30 * NGTCP2_SECONDS
+            # Idle timeout: QUIC closes the *connection* (not the UDP socket) when no packet
+            # is *received* from the peer for this long. The UDP listener stays open for new
+            # connections. Server sends PING every 10s to prompt ACKs; use 120s so mobile/background
+            # clients have time to respond.
+            self.transport_params.max_idle_timeout = 120 * NGTCP2_SECONDS
             # active_connection_id_limit in [2, 7]; keep 2 from default
             self.transport_params.active_connection_id_limit = 2
             # Ensure ngtcp2-valid defaults for params checked during handshake (in case default init was fallback)
@@ -693,24 +696,61 @@ class NGTCP2Connection:
                 if datalen:
                     offset_val = int(offset)
                     end_offset = offset_val + int(datalen)
+
+                    # Track FIN offset for out-of-order delivery
+                    if flags & NGTCP2_STREAM_DATA_FLAG_FIN:
+                        stream._fin_offset = end_offset
+
                     # Drop fully duplicated data (retransmissions)
                     if end_offset <= stream.rx_offset:
-                        if flags & NGTCP2_STREAM_DATA_FLAG_FIN:
+                        if getattr(stream, "_fin_offset", None) == stream.rx_offset:
                             stream.state = "closed"
                         return 0
+
                     payload = ctypes.string_at(data, datalen)
                     if offset_val < stream.rx_offset:
                         skip = stream.rx_offset - offset_val
                         payload = payload[skip:]
+                        offset_val = stream.rx_offset
+
+                    # Buffer out-of-order data
+                    if offset_val > stream.rx_offset:
+                        pending = getattr(stream, "_pending", None)
+                        if pending is None:
+                            pending = {}
+                            stream._pending = pending
+                        if offset_val not in pending:
+                            pending[offset_val] = payload
+                            # Extend flow control for accepted bytes
+                            if ngtcp2_conn_extend_max_stream_offset:
+                                ngtcp2_conn_extend_max_stream_offset(conn_obj._conn_ptr, stream_id, len(payload))
+                            if ngtcp2_conn_extend_max_offset:
+                                ngtcp2_conn_extend_max_offset(conn_obj._conn_ptr, len(payload))
+                        return 0
+
+                    # In-order data: append and advance
                     if payload:
-                        stream.append_data(payload, fin=bool(flags & NGTCP2_STREAM_DATA_FLAG_FIN))
+                        stream.append_data(payload, fin=False)
                         if not getattr(conn_obj, "_logged_first_stream", False):
                             conn_obj._logged_first_stream = True
-                        # Update flow control windows only for new bytes
                         if ngtcp2_conn_extend_max_stream_offset:
                             ngtcp2_conn_extend_max_stream_offset(conn_obj._conn_ptr, stream_id, len(payload))
                         if ngtcp2_conn_extend_max_offset:
                             ngtcp2_conn_extend_max_offset(conn_obj._conn_ptr, len(payload))
+
+                    # Flush any contiguous pending chunks
+                    pending = getattr(stream, "_pending", None)
+                    while pending and stream.rx_offset in pending:
+                        chunk = pending.pop(stream.rx_offset)
+                        stream.append_data(chunk, fin=False)
+                        if ngtcp2_conn_extend_max_stream_offset:
+                            ngtcp2_conn_extend_max_stream_offset(conn_obj._conn_ptr, stream_id, len(chunk))
+                        if ngtcp2_conn_extend_max_offset:
+                            ngtcp2_conn_extend_max_offset(conn_obj._conn_ptr, len(chunk))
+
+                    # Close if FIN offset reached
+                    if getattr(stream, "_fin_offset", None) == stream.rx_offset:
+                        stream.state = "closed"
             except Exception as e:
                 logger.debug("recv_stream_data_callback error: %s", e)
             return 0
