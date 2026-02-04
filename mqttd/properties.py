@@ -238,10 +238,14 @@ class PropertyEncoder:
             pos += 1
             
             if prop_id == PropertyType.PAYLOAD_FORMAT_INDICATOR:
+                if pos >= len(data):
+                    raise ValueError("Truncated properties: missing value for property 0x%02x" % prop_id)
                 properties[prop_id] = data[pos]
                 pos += 1
             
             elif prop_id == PropertyType.MESSAGE_EXPIRY_INTERVAL:
+                if pos + 4 > len(data):
+                    raise ValueError("Truncated properties: MESSAGE_EXPIRY_INTERVAL")
                 properties[prop_id] = struct.unpack('>I', data[pos:pos+4])[0]
                 pos += 4
             
@@ -254,8 +258,12 @@ class PropertyEncoder:
                 properties[prop_id] = value
             
             elif prop_id == PropertyType.CORRELATION_DATA:
+                if pos + 2 > len(data):
+                    raise ValueError("Truncated properties: CORRELATION_DATA length")
                 length = struct.unpack('>H', data[pos:pos+2])[0]
                 pos += 2
+                if pos + length > len(data):
+                    raise ValueError("Truncated properties: CORRELATION_DATA")
                 properties[prop_id] = data[pos:pos+length]
                 pos += length
             
@@ -268,6 +276,8 @@ class PropertyEncoder:
                 pos += consumed
             
             elif prop_id == PropertyType.SESSION_EXPIRY_INTERVAL:
+                if pos + 4 > len(data):
+                    raise ValueError("Truncated properties: SESSION_EXPIRY_INTERVAL")
                 properties[prop_id] = struct.unpack('>I', data[pos:pos+4])[0]
                 pos += 4
             
@@ -276,6 +286,8 @@ class PropertyEncoder:
                 properties[prop_id] = value
             
             elif prop_id == PropertyType.SERVER_KEEP_ALIVE:
+                if pos + 2 > len(data):
+                    raise ValueError("Truncated properties: SERVER_KEEP_ALIVE")
                 properties[prop_id] = struct.unpack('>H', data[pos:pos+2])[0]
                 pos += 2
             
@@ -284,20 +296,30 @@ class PropertyEncoder:
                 properties[prop_id] = value
             
             elif prop_id == PropertyType.AUTHENTICATION_DATA:
+                if pos + 2 > len(data):
+                    raise ValueError("Truncated properties: AUTHENTICATION_DATA length")
                 length = struct.unpack('>H', data[pos:pos+2])[0]
                 pos += 2
+                if pos + length > len(data):
+                    raise ValueError("Truncated properties: AUTHENTICATION_DATA")
                 properties[prop_id] = data[pos:pos+length]
                 pos += length
             
             elif prop_id == PropertyType.REQUEST_PROBLEM_INFORMATION:
+                if pos >= len(data):
+                    raise ValueError("Truncated properties: REQUEST_PROBLEM_INFORMATION")
                 properties[prop_id] = data[pos]
                 pos += 1
             
             elif prop_id == PropertyType.WILL_DELAY_INTERVAL:
+                if pos + 4 > len(data):
+                    raise ValueError("Truncated properties: WILL_DELAY_INTERVAL")
                 properties[prop_id] = struct.unpack('>I', data[pos:pos+4])[0]
                 pos += 4
             
             elif prop_id == PropertyType.REQUEST_RESPONSE_INFORMATION:
+                if pos >= len(data):
+                    raise ValueError("Truncated properties: REQUEST_RESPONSE_INFORMATION")
                 properties[prop_id] = data[pos]
                 pos += 1
             
@@ -314,22 +336,32 @@ class PropertyEncoder:
                 properties[prop_id] = value
             
             elif prop_id == PropertyType.RECEIVE_MAXIMUM:
+                if pos + 2 > len(data):
+                    raise ValueError("Truncated properties: RECEIVE_MAXIMUM")
                 properties[prop_id] = struct.unpack('>H', data[pos:pos+2])[0]
                 pos += 2
             
             elif prop_id == PropertyType.TOPIC_ALIAS_MAXIMUM:
+                if pos + 2 > len(data):
+                    raise ValueError("Truncated properties: TOPIC_ALIAS_MAXIMUM")
                 properties[prop_id] = struct.unpack('>H', data[pos:pos+2])[0]
                 pos += 2
             
             elif prop_id == PropertyType.TOPIC_ALIAS:
+                if pos + 2 > len(data):
+                    raise ValueError("Truncated properties: TOPIC_ALIAS")
                 properties[prop_id] = struct.unpack('>H', data[pos:pos+2])[0]
                 pos += 2
             
             elif prop_id == PropertyType.MAXIMUM_QOS:
+                if pos >= len(data):
+                    raise ValueError("Truncated properties: MAXIMUM_QOS")
                 properties[prop_id] = data[pos]
                 pos += 1
             
             elif prop_id == PropertyType.RETAIN_AVAILABLE:
+                if pos >= len(data):
+                    raise ValueError("Truncated properties: RETAIN_AVAILABLE")
                 properties[prop_id] = data[pos]
                 pos += 1
             
@@ -342,18 +374,26 @@ class PropertyEncoder:
                 properties[prop_id].append((name, value))
             
             elif prop_id == PropertyType.MAXIMUM_PACKET_SIZE:
+                if pos + 4 > len(data):
+                    raise ValueError("Truncated properties: MAXIMUM_PACKET_SIZE")
                 properties[prop_id] = struct.unpack('>I', data[pos:pos+4])[0]
                 pos += 4
             
             elif prop_id == PropertyType.WILDCARD_SUBSCRIPTION_AVAILABLE:
+                if pos >= len(data):
+                    raise ValueError("Truncated properties: WILDCARD_SUBSCRIPTION_AVAILABLE")
                 properties[prop_id] = data[pos]
                 pos += 1
             
             elif prop_id == PropertyType.SUBSCRIPTION_IDENTIFIER_AVAILABLE:
+                if pos >= len(data):
+                    raise ValueError("Truncated properties: SUBSCRIPTION_IDENTIFIER_AVAILABLE")
                 properties[prop_id] = data[pos]
                 pos += 1
             
             elif prop_id == PropertyType.SHARED_SUBSCRIPTION_AVAILABLE:
+                if pos >= len(data):
+                    raise ValueError("Truncated properties: SHARED_SUBSCRIPTION_AVAILABLE")
                 properties[prop_id] = data[pos]
                 pos += 1
             

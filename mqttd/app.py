@@ -315,23 +315,19 @@ class MQTTApp:
         Returns:
             Tuple of (message_type, remaining_length, total_bytes_read)
         """
-        # Read first two bytes
+        # Read first two bytes (msg_type + first byte of remaining length)
         header_data = await reader.readexactly(2)
         msg_type = header_data[0]
         
-        # Decode remaining length (may be multi-byte)
+        # Decode remaining length (may be 1-4 bytes); we may only have 1 byte so far
         remaining_length, length_bytes = MQTTProtocol.decode_remaining_length(header_data, 1)
+        # If first byte has high bit set, we need more bytes for remaining length
+        while length_bytes == 1 and len(header_data) >= 2 and (header_data[-1] & 0x80):
+            extra = await reader.readexactly(1)
+            header_data = header_data + extra
+            remaining_length, length_bytes = MQTTProtocol.decode_remaining_length(header_data, 1)
         
-        # If we need more bytes for remaining length, read them
-        if length_bytes > 1:
-            extra_bytes = await reader.readexactly(length_bytes - 1)
-            # Re-decode with full data
-            full_header = header_data + extra_bytes
-            remaining_length, _ = MQTTProtocol.decode_remaining_length(full_header, 1)
-            total_bytes = 1 + length_bytes
-        else:
-            total_bytes = 2
-        
+        total_bytes = 1 + length_bytes
         return msg_type, remaining_length, total_bytes
     
     async def _handle_connect(self, reader: asyncio.StreamReader,
@@ -584,6 +580,16 @@ class MQTTApp:
             client._session = session
             return client
             
+        except (ValueError, IndexError) as e:
+            logger.error(f"Error handling CONNECT: {e}")
+            try:
+                # Send CONNACK MALFORMED_PACKET so client stops retrying
+                connack = MQTT5Protocol.build_connack_v5(reason_code=ReasonCode.MALFORMED_PACKET)
+                writer.write(connack)
+                await writer.drain()
+            except Exception:
+                pass
+            return None
         except Exception as e:
             logger.error(f"Error handling CONNECT: {e}")
             return None

@@ -123,6 +123,7 @@ _NGTCP2_READ_PKT_ERRORS = {
     -225: "NGTCP2_ERR_TRANSPORT_PARAM (transport parameter error)",
     -216: "NGTCP2_ERR_MALFORMED_TRANSPORT_PARAM (malformed transport parameter)",
     -215: "NGTCP2_ERR_REQUIRED_TRANSPORT_PARAM (required transport parameter missing)",
+    -228: "NGTCP2_ERR_STREAM_RESET (stream reset by peer) or connection/stream closed by client",
 }
 
 # handle_expiry return codes: treat as connection close (log once, mark closed)
@@ -410,6 +411,10 @@ class NGTCP2Connection:
             # is *received* from the peer for this long. The UDP listener stays open for new
             # connections. Server sends PING every 10s to prompt ACKs; use 120s so mobile/background
             # clients have time to respond.
+            # Per RFC 9000 §10.1: the idle timeout is RESET whenever the server receives ANY
+            # packet from the client (e.g. MQTT PINGREQ, PUBLISH, or QUIC ACKs). So client
+            # activity or any message from the client resets the timeout; we only close if
+            # the client is silent for the full 120s.
             self.transport_params.max_idle_timeout = 120 * NGTCP2_SECONDS
             # active_connection_id_limit in [2, 7]; keep 2 from default
             self.transport_params.active_connection_id_limit = 2
@@ -877,6 +882,12 @@ class NGTCP2Connection:
             if result != 0:
                 err_msg = _ngtcp2_read_pkt_error_message(result)
                 logger.warning(f"ngtcp2_conn_read_pkt returned error: {result} ({err_msg})")
+                # -228: stream/connection closed by peer (e.g. client closed app or sent STREAM_RESET)
+                if result == -228:
+                    if self.state != "closed":
+                        logger.info("Connection closed by peer (stream reset or connection close)")
+                    self.state = "closed"
+                    return False
                 if result in (
                     -225,  # NGTCP2_ERR_TRANSPORT_PARAM
                     -215,  # NGTCP2_ERR_REQUIRED_TRANSPORT_PARAM
@@ -911,7 +922,11 @@ class NGTCP2Connection:
             self.bytes_received += len(data)
             self.last_packet_at = time.time()
             self.last_io_at = time.time()
-            
+            # ngtcp2 resets the connection idle timeout internally when a packet is successfully
+            # processed (i.e. we reached here with result==0). So any client packet (PINGREQ,
+            # PUBLISH, or QUIC-level ACK) resets the 120s idle timer; timeout only fires if
+            # the client sends nothing for 120s.
+
             # Check if handshake completed
             if ngtcp2_conn_get_handshake_completed:
                 if ngtcp2_conn_get_handshake_completed(self._conn_ptr):
@@ -1117,7 +1132,10 @@ class NGTCP2Connection:
     
     def handle_expiry(self, timestamp: Optional[int] = None) -> bool:
         """
-        Handle connection expiry/timeouts
+        Handle connection expiry/timeouts.
+        Idle timeout only fires if ngtcp2 has not received any packet from the client for
+        max_idle_timeout (120s). Receiving any client packet (e.g. MQTT PINGREQ, PUBLISH)
+        resets the timer inside ngtcp2 before we get here.
         
         Based on curl's check_and_set_expiry. ngtcp2 requires ts > conn->log.last_ts.
         """
