@@ -3,13 +3,22 @@ MQTTD Application - FastAPI-like MQTT Server
 """
 
 import asyncio
+import base64
+import json
 import ssl
 import logging
 import struct
 import secrets
+import uuid
 from typing import Optional, Dict, List, Callable, Any, Tuple, Set, Union
 from pathlib import Path
 import socket
+
+# Redis keys/channels for "store until MCP response then reply" flow
+MCP_REQUEST_PREFIX = "mqttd:request:"
+MCP_RESPONSES_CHANNEL = "mqttd:mcp:responses"
+MCP_REQUESTS_CHANNEL = "mqttd:mcp:requests"
+MCP_REQUEST_TTL_SECONDS = 300  # 5 minutes
 
 from .protocol import (
     MQTTProtocol, MQTTMessageType, MQTTConnAckCode,
@@ -617,6 +626,8 @@ class MQTTApp:
             
             # Create pubsub client
             self._redis_pubsub = self._redis_client.pubsub()
+            # Subscribe to MCP responses so we can reply to clients when agents respond
+            await self._redis_pubsub.subscribe(MCP_RESPONSES_CHANNEL)
             
             # Start Redis message listener
             self._redis_listener_task = asyncio.create_task(self._redis_message_listener())
@@ -660,8 +671,11 @@ class MQTTApp:
                         channel = message['channel'].decode('utf-8') if isinstance(message['channel'], bytes) else message['channel']
                         payload = message['data']
                         
-                        # Forward to all subscribed MQTT clients
-                        await self._forward_to_mqtt_clients(channel, payload)
+                        if channel == MCP_RESPONSES_CHANNEL:
+                            await self._handle_mcp_response(payload)
+                        else:
+                            # Forward to all subscribed MQTT clients
+                            await self._forward_to_mqtt_clients(channel, payload)
                         
                 except asyncio.TimeoutError:
                     continue
@@ -673,6 +687,56 @@ class MQTTApp:
             logger.info("Redis message listener cancelled")
         except Exception as e:
             logger.error(f"Redis message listener error: {e}")
+    
+    async def _handle_mcp_response(self, payload: bytes) -> None:
+        """
+        Handle a response from an MCP agent: look up stored request by correlation_id,
+        publish reply to the client's response_topic, then remove the stored request.
+        """
+        if not self._redis_client:
+            return
+        try:
+            raw = payload.decode('utf-8') if isinstance(payload, bytes) else payload
+            msg = json.loads(raw)
+        except (ValueError, UnicodeDecodeError) as e:
+            logger.warning(f"Invalid MCP response payload: {e}")
+            return
+        correlation_id = msg.get('correlation_id')
+        payload_b64 = msg.get('payload_b64', msg.get('payload'))
+        if not correlation_id:
+            logger.warning("MCP response missing correlation_id")
+            return
+        if payload_b64 is None:
+            payload_b64 = ""
+        try:
+            reply_payload = base64.b64decode(payload_b64) if isinstance(payload_b64, str) else payload_b64
+        except Exception as e:
+            logger.warning(f"MCP response payload_b64 decode error: {e}")
+            reply_payload = payload_b64.encode('utf-8') if isinstance(payload_b64, str) else b""
+        key = MCP_REQUEST_PREFIX + correlation_id
+        try:
+            stored = await self._redis_client.get(key)
+        except Exception as e:
+            logger.error(f"Redis GET failed for {key}: {e}")
+            return
+        if not stored:
+            logger.debug(f"No stored request for correlation_id={correlation_id} (expired or unknown)")
+            return
+        try:
+            data = json.loads(stored.decode('utf-8'))
+        except (ValueError, UnicodeDecodeError) as e:
+            logger.warning(f"Invalid stored request value: {e}")
+            return
+        response_topic = data.get('response_topic')
+        if not response_topic:
+            logger.warning("Stored request missing response_topic")
+            await self._redis_client.delete(key)
+            return
+        try:
+            await self._forward_to_mqtt_clients(response_topic, reply_payload)
+            await self._redis_client.delete(key)
+        except Exception as e:
+            logger.error(f"Failed to forward MCP reply to {response_topic}: {e}")
     
     async def _route_directly(self, topic: str, payload: bytes, qos: int = 0,
                               subscription_identifiers: Optional[List[int]] = None,
@@ -1154,6 +1218,38 @@ class MQTTApp:
                     # Store retained message
                     self._retained_messages[message.topic] = (message.payload, qos, message.retain)
                     logger.debug(f"Stored retained message for topic: {message.topic}")
+            
+            # Store request in Redis when response_topic is set (MQTT 5.0 request/response; MCP reply flow)
+            if is_mqtt5 and self.use_redis and self._redis_client:
+                props = publish_info.get('properties') or {}
+                response_topic = props.get(PropertyType.RESPONSE_TOPIC)
+                correlation_data = props.get(PropertyType.CORRELATION_DATA)
+                if response_topic:
+                    if correlation_data is not None and correlation_data:
+                        correlation_id = base64.b64encode(correlation_data).decode() if isinstance(correlation_data, bytes) else str(correlation_data)
+                    else:
+                        correlation_id = str(uuid.uuid4())
+                    key = MCP_REQUEST_PREFIX + correlation_id
+                    request_value = json.dumps({
+                        "response_topic": response_topic,
+                        "correlation_data_b64": base64.b64encode(correlation_data).decode() if isinstance(correlation_data, bytes) and correlation_data else "",
+                        "client_id": client.client_id,
+                        "topic": message.topic,
+                    }).encode('utf-8')
+                    try:
+                        await self._redis_client.set(key, request_value, ex=MCP_REQUEST_TTL_SECONDS)
+                        await self._redis_client.publish(
+                            MCP_REQUESTS_CHANNEL,
+                            json.dumps({
+                                "correlation_id": correlation_id,
+                                "topic": message.topic,
+                                "payload_b64": base64.b64encode(message.payload).decode(),
+                                "response_topic": response_topic,
+                            }).encode('utf-8')
+                        )
+                        logger.debug(f"Stored MCP request correlation_id={correlation_id}, response_topic={response_topic}")
+                    except Exception as e:
+                        logger.warning(f"Failed to store MCP request in Redis: {e}")
             
             # Route message: Redis pub/sub OR direct routing
             if self.use_redis and self._redis_client:

@@ -2,591 +2,351 @@
 
 A high-performance Python package for creating MQTT and MQTTS servers with a FastAPI-like decorator-based API. Fully compatible with libcurl clients and designed for production use.
 
-**Now supports MQTT 5.0** with full backward compatibility for MQTT 3.1.1!
+**Now supports MQTT 5.0** with full backward compatibility for MQTT 3.1.1.
 
-## 🚀 Features
+---
+
+## Supported Features (Code-Verified)
+
+The following features are implemented and used in the codebase (`ref-code/mqttd`). This list is derived from line-by-line analysis of `mqttd/app.py`, `mqttd/session.py`, `mqttd/thread_safe.py`, and related modules.
 
 ### Core Features
-- **FastAPI-like API**: Use decorators to define topic subscriptions and message handlers
-- **MQTT 5.0 Protocol**: Full support for MQTT 5.0 with automatic protocol detection
-- **MQTT 3.1.1 Compatibility**: Full backward compatibility with MQTT 3.1.1 clients
-- **MQTTS Support**: TLS/SSL support for secure MQTT connections (port 8883)
-- **QUIC/HTTP3 Support**: Optional QUIC transport for lower latency and better performance in lossy networks
-- **Async/Await**: Built on asyncio for high-performance async operations
-- **Configuration File**: Support for configuration files (similar to C reference implementation)
+- **FastAPI-like API**: Decorators `@app.subscribe(topic)` and `@app.publish_handler(topic)` for topic subscriptions and PUBLISH handlers
+- **MQTT 5.0 Protocol**: Full support with automatic protocol detection (MQTT 3.1.1 vs 5.0)
+- **MQTT 3.1.1 Compatibility**: Full backward compatibility
+- **MQTTS Support**: TLS/SSL via `ssl_context` (e.g. port 8883)
+- **QUIC Transport**: Optional MQTT over QUIC (ngtcp2, pure Python, or aioquic)
+- **Async/Await**: Built on asyncio; one task per client connection
+- **Configuration File**: `config_file` with options (version, PUBLISH-before-SUBACK, short-PUBLISH, error-CONNACK, excessive-remaining, Testnum)
+
+### Multiple Concurrent Clients
+- **Per-connection tasks**: Each TCP or QUIC connection is handled by a dedicated asyncio task (`_handle_client`)
+- **Connection state**: `_clients` dict maps socket to `(MQTTClient, StreamWriter)`; connection limits via `max_connections` and `max_connections_per_ip`
+- **Session management**: Per ClientID sessions (SessionManager); session takeover and concurrent same-ClientID handling per MQTT 5.0 (Clean Start, Session Present, Session Expiry Interval)
 
 ### MQTT 5.0 Features
-- **Reason Codes**: Reason codes in all ACK packets
-- **Properties Support**: Full support for all 32 property types including:
-  - User Properties
-  - Message Expiry Interval
-  - Topic Aliases
-  - Response Topic
-  - Correlation Data
-  - Content Type
-  - And many more...
-- **Session Management**: 
-  - Session Expiry Interval
-  - Clean Start flag
-  - Session Present indicator
-  - Proper session takeover handling
-- **Flow Control**: Receive Maximum negotiation
-- **Packet Size Limits**: Maximum Packet Size negotiation
-- **Will Message**: Last Will and Testament with MQTT 5.0 properties
+- **Reason codes**: In CONNACK, SUBACK, UNSUBACK, PUBACK, etc.
+- **Properties**: Full encode/decode for property types including User Properties, Message Expiry Interval, Topic Aliases, **Response Topic**, **Correlation Data**, Content Type, Subscription Identifier, Receive Maximum, etc.
+- **Session**: Session Expiry Interval, Clean Start, Session Present, session takeover, expired session cleanup
+- **Flow control**: Receive Maximum negotiation; in-flight QoS tracking per client
+- **Will message**: Last Will and Testament with MQTT 5.0 properties; **Will Delay Interval** supported (delayed send after disconnect)
+- **Subscription options**: No Local, Retain As Published, Retain Handling (0/1/2) per subscription
+- **Topic aliases**: Server-side alias mapping per session
+- **Message expiry**: Message Expiry Interval checked before forwarding
 
 ### Routing Modes
-- **Direct Routing** (default): In-memory routing between clients (lower latency, single server)
-- **Redis Pub/Sub** (optional): Distributed routing for multi-server deployments
+- **Direct routing** (default): In-memory routing; topic trie + shared subscription trie for O(m) lookup
+- **Redis Pub/Sub** (optional): Publish to Redis channel by topic; subscribe to Redis when MQTT clients subscribe; `_redis_message_listener` forwards Redis messages to MQTT clients
 
-### Performance & Scalability
-- **No-GIL Support**: Compatible with Python 3.13+ no-GIL mode for true parallelism
-- **Thread-Safe**: Thread-safe topic trie for O(m) subscription lookup (m = topic depth)
-- **Connection Limits**: Configurable connection limits and rate limiting
-- **Session Persistence**: Efficient session management with expiry support
+### Redis and MCP Request/Response
+- **Redis connection**: Optional `redis_host`/`redis_port`/`redis_url`; `_connect_redis()`, `_disconnect_redis()`, health check reports `redis_connected`
+- **Redis Pub/Sub**: Publish on PUBLISH; subscribe per topic; forward Redis messages to subscribed MQTT clients
+- **Store until MCP response, then reply to client**: When a client sends a PUBLISH with MQTT 5.0 **Response Topic** (and optionally **Correlation Data**), the server:
+  - Stores request context in Redis at `mqttd:request:{correlation_id}` with TTL (e.g. 300s)
+  - Publishes to channel `mqttd:mcp:requests` for MCP workers (payload: correlation_id, topic, payload_b64, response_topic)
+  - Subscribes to `mqttd:mcp:responses`; when a response message arrives (JSON: correlation_id, payload_b64), looks up the stored request, forwards the reply to `response_topic`, and deletes the request key
 
-### Transport Protocols
-- **TCP/IP**: Standard MQTT over TCP (port 1883) - Default, can be disabled
-- **TLS/TCP**: Secure MQTT over TLS (port 8883)
-- **QUIC/HTTP3**: Optional QUIC transport with multiple implementations:
-  - **ngtcp2** (production-grade, best performance) - requires C library
-  - **Pure Python** (compatible with no-GIL Python)
-  - **aioquic** (fallback for regular Python)
-- **Transport Modes**:
-  - **TCP-only** (default): `enable_tcp=True, enable_quic=False`
-  - **QUIC-only**: `enable_tcp=False, enable_quic=True`
-  - **Both**: `enable_tcp=True, enable_quic=True` (parallel operation)
+### Retained Messages
+- **Store/delete**: Retained PUBLISH stored in `_retained_messages`; empty payload with retain clears the topic
+- **Delivery on subscribe**: `_deliver_retained_messages` with MQTT 5.0 retain_handling and retain_as_published
 
-## 📦 Installation
+### Shared Subscriptions (MQTT 5.0)
+- **Syntax**: `$share/group/topic`; round-robin delivery per group via `_shared_trie` and `_shared_group_index`
 
-### Basic Installation
+### Keepalive and Timeouts
+- **Keepalive tracking**: `_client_keepalive` stores last_activity, keepalive_seconds, and optional ping task per socket
+- **Activity reset**: On any received message (including PINGREQ and PUBLISH), last_activity is updated so timeout is effectively reset when the client is active
+- **Keepalive monitor**: Background task disconnects if no activity for 1.5× keepalive interval
+- **Read timeout**: `reader.read()` uses keepalive-based timeout (1.5× keepalive) so idle connections are closed
+
+### Rate Limiting
+- **Per-client**: `_rate_limits` tracks message count and subscription count per socket
+- **Options**: `max_messages_per_second`, `max_subscriptions_per_minute`; `_check_rate_limit()` used on PUBLISH and SUBSCRIBE
+
+### Observability and Admin
+- **Metrics**: `get_metrics()` returns total_connections, current_connections, total_messages_published/received, total_subscriptions/unsubscriptions, retained_messages_count, active_subscriptions_count, connections_per_ip
+- **Health**: `health_check()` returns status (healthy/degraded), running, connections, max_connections, redis_connected, errors list
+- **Graceful shutdown**: `shutdown(timeout)` sets _running, closes server, waits for connections to drain (with timeout)
+
+### Programmatic Publish
+- **To all**: Normal PUBLISH routing and optional `app.publish(topic, payload, qos, retain)` when using Redis
+- **To one client**: `publish_to_client(client, topic, payload, qos, retain)` sends a PUBLISH to a specific client by client_id
+
+### Thread-Safety and No-GIL
+- **Thread-safe structures** (`mqttd/thread_safe.py`): `ThreadSafeDict`, `ThreadSafeSet`, `ThreadSafeTopicTrie`, `ThreadSafeConnectionPool` (RLock-based) for use with Python 3.13+ no-GIL or 3.14t
+- **Topic lookup**: `_topic_trie` and `_shared_trie` are ThreadSafeTopicTrie for O(m) subscription matching
+
+### Transport
+- **TCP**: `asyncio.start_server(_handle_client, host, port, ssl=...)`; can be disabled with `enable_tcp=False`
+- **QUIC**: ngtcp2 (preferred), pure Python, or aioquic; `enable_quic`, `quic_port`, `quic_certfile`, `quic_keyfile`; QUIC-only mode when TCP disabled
+
+---
+
+## Installation
+
+### Basic
 
 ```bash
 pip install -e .
 ```
 
 ### Requirements
-- **Python**: 3.13+ (recommended for no-GIL support) or 3.7+ (standard Python)
-- **Redis**: Optional - only needed if using Redis pub/sub mode (default: direct routing, no Redis needed)
+- **Python**: 3.7+ (3.13+ recommended for no-GIL; 3.14t for free-threaded)
+- **Redis**: Optional — only for Redis pub/sub and MCP request/response (`pip install redis>=5.0.0` or `pip install -e ".[redis]"`)
 
-**Redis is optional!** The server works without Redis using direct routing (default).
-
-### Optional Dependencies
-
-**Build server first (QUIC with ngtcp2 + WolfSSL):**  
-To run MQTT-over-QUIC with the production ngtcp2 backend, build C libs then install the Python package:
+### QUIC (ngtcp2 + WolfSSL)
 
 ```bash
-./scripts/build-server.sh   # WolfSSL + ngtcp2, then pip install -e .
+./scripts/build-server.sh   # then pip install -e .
 ```
 
-See [docs/BUILD_SERVER.md](docs/BUILD_SERVER.md) for prerequisites, manual steps, and troubleshooting.
+See [docs/BUILD_SERVER.md](docs/BUILD_SERVER.md) for details.
 
-For development:
-```bash
-pip install -e ".[dev]"
-```
+---
 
-## 🎯 Quick Start
+## Quick Start
 
-### Basic MQTT Server (Direct Routing - No Redis)
+### Basic server (direct routing, no Redis)
 
 ```python
 from mqttd import MQTTApp, MQTTMessage, MQTTClient
 
-# Create app with direct routing (default - no Redis needed!)
-app = MQTTApp(port=1883)  # use_redis=False by default
+app = MQTTApp(port=1883)
 
 @app.subscribe("sensors/temperature")
-async def handle_temperature(topic: str, client: MQTTClient):
-    """Handle subscription to temperature topic"""
+async def on_subscribe(topic: str, client: MQTTClient):
     print(f"Client {client.client_id} subscribed to {topic}")
-    # Messages will be directly routed to this client
 
 @app.publish_handler("sensors/+")
-async def handle_publish(message: MQTTMessage, client: MQTTClient):
-    """Handle incoming PUBLISH messages - directly routed to subscribers"""
-    print(f"Received on {message.topic}: {message.payload_str}")
-    # Message is automatically routed directly to subscribed clients
+async def on_publish(message: MQTTMessage, client: MQTTClient):
+    print(f"Received {message.topic}: {message.payload_str}")
 
 if __name__ == "__main__":
     app.run()
 ```
 
-**How it works (Direct Routing):**
-- When a client **subscribes** to a topic, the server tracks the subscription in memory
-- When a client **publishes** a message, the server directly sends it to all subscribed clients
-- **Lower latency** - no Redis network hop
-- **Simpler** - no external dependencies
-- **Perfect for single-server deployments**
-
-### MQTT Server with Redis (Multi-Server)
+### Multiple clients and connection limits
 
 ```python
-from mqttd import MQTTApp, MQTTMessage, MQTTClient
-
-# Create app with Redis pub/sub backend (for multi-server scaling)
 app = MQTTApp(
     port=1883,
-    redis_host="localhost",  # Enable Redis mode
+    max_connections=1000,
+    max_connections_per_ip=50
+)
+# Each connection gets its own task; sessions are per ClientID
+app.run()
+```
+
+### Redis Pub/Sub (multi-server)
+
+```python
+app = MQTTApp(
+    port=1883,
+    redis_host="localhost",
     redis_port=6379
 )
 
-@app.subscribe("sensors/temperature")
-async def handle_temperature(topic: str, client: MQTTClient):
-    """Handle subscription to temperature topic"""
-    print(f"Client {client.client_id} subscribed to {topic}")
-    # Messages from Redis will be automatically forwarded to this client
+@app.subscribe("sensors/#")
+async def on_sub(topic: str, client: MQTTClient):
+    print(f"{client.client_id} subscribed to {topic}")
 
 @app.publish_handler("sensors/+")
-async def handle_publish(message: MQTTMessage, client: MQTTClient):
-    """Handle incoming PUBLISH messages - automatically published to Redis"""
-    print(f"Received on {message.topic}: {message.payload_str}")
-    # Message is automatically published to Redis channel
-
-if __name__ == "__main__":
-    app.run()
-```
-
-**How it works (Redis Mode):**
-- When a client **subscribes** to a topic, the server subscribes to the corresponding Redis channel
-- When a client **publishes** a message, it's published to Redis
-- Redis messages are automatically forwarded to all subscribed MQTT clients
-- **Scalable** - multiple servers can share the same Redis
-- **Distributed** - messages flow across server boundaries
-
-### MQTTS (TLS) Server
-
-```python
-import ssl
-from mqttd import MQTTApp, MQTTMessage, MQTTClient
-
-# Create SSL context
-ssl_context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
-ssl_context.load_cert_chain('server.crt', 'server.key')
-
-# MQTTS with direct routing
-app = MQTTApp(
-    port=8883,
-    ssl_context=ssl_context
-)
-
-@app.subscribe("secure/topic")
-async def handle_secure(topic: str, client: MQTTClient):
-    print(f"Secure client subscribed: {topic}")
+async def on_pub(message: MQTTMessage, client: MQTTClient):
+    print(f"PUBLISH {message.topic} (published to Redis)")
 
 app.run()
 ```
 
-### MQTT 5.0 Server
+### Redis + MCP request/response (store until agent replies)
+
+Client sends PUBLISH with MQTT 5.0 **Response Topic** and optional **Correlation Data**. Server stores the request in Redis, publishes to `mqttd:mcp:requests`; when an MCP worker publishes a response to `mqttd:mcp:responses`, the server forwards the reply to the client’s response topic.
+
+**Server (with Redis):**
 
 ```python
-from mqttd import MQTTApp, MQTTMessage, MQTTClient
+app = MQTTApp(port=1883, redis_host="localhost", redis_port=6379)
 
-# Create MQTT app (automatically handles both MQTT 3.1.1 and 5.0)
+@app.subscribe("devices/+/request")
+async def on_request_sub(topic: str, client: MQTTClient):
+    print(f"Client {client.client_id} subscribed to {topic}")
+
+@app.publish_handler("devices/+/request")
+async def on_request_pub(message: MQTTMessage, client: MQTTClient):
+    # Request is auto-stored in Redis (when response_topic is set) and
+    # published to mqttd:mcp:requests; MCP workers consume and reply
+    # to mqttd:mcp:responses; server then forwards to response_topic
+    print(f"Request on {message.topic} from {client.client_id}")
+
+app.run()
+```
+
+**MCP worker contract (Redis):**
+- Subscribe to Redis channel `mqttd:mcp:requests`. Each message is JSON: `correlation_id`, `topic`, `payload_b64`, `response_topic`.
+- After calling your MCP agent, publish to Redis channel `mqttd:mcp:responses` a JSON message: `{"correlation_id": "<id>", "payload_b64": "<base64 reply>"}`.
+
+**Client (MQTT 5.0):** Publish with Response Topic and optional Correlation Data so the server stores the request and later delivers the reply on that topic.
+
+### Metrics and health (e.g. for admin API)
+
+```python
 app = MQTTApp(port=1883)
 
-@app.subscribe("sensors/temperature")
-async def handle_temperature_subscribe(topic: str, client: MQTTClient):
-    """Handle subscription - works with both MQTT 3.1.1 and 5.0"""
-    protocol_version = getattr(client, '_protocol_version', 4)
-    mqtt_version = "MQTT 5.0" if protocol_version == 5 else "MQTT 3.1.1"
-    print(f"Client {client.client_id} ({mqtt_version}) subscribed to {topic}")
+# In another thread or admin endpoint:
+metrics = app.get_metrics()
+# total_connections, current_connections, total_messages_published,
+# retained_messages_count, active_subscriptions_count, connections_per_ip, ...
 
-@app.publish_handler("sensors/+")
-async def handle_sensor_publish(message: MQTTMessage, client: MQTTClient):
-    """Handle incoming PUBLISH messages"""
-    print(f"Received PUBLISH from {client.client_id}")
-    print(f"  Topic: {message.topic}")
-    print(f"  Payload: {message.payload_str}")
-    print(f"  QoS: {message.qos}")
-
-if __name__ == "__main__":
-    app.run()
+health = app.health_check()
+# status, running, connections, max_connections, redis_connected, errors
 ```
 
-### MQTT over QUIC Server (Parallel Mode - TCP + QUIC)
+### MQTTS (TLS)
 
 ```python
-from mqttd import MQTTApp, MQTTMessage, MQTTClient
+import ssl
+from mqttd import MQTTApp, MQTTClient
 
-# Create MQTT app with both TCP and QUIC enabled
+ssl_ctx = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
+ssl_ctx.load_cert_chain("server.crt", "server.key")
+
+app = MQTTApp(port=8883, ssl_context=ssl_ctx)
+
+@app.subscribe("secure/topic")
+async def on_secure(topic: str, client: MQTTClient):
+    print(f"Secure client: {client.client_id} -> {topic}")
+
+app.run()
+```
+
+### MQTT over QUIC (QUIC-only)
+
+```python
 app = MQTTApp(
-    port=1883,  # TCP port
-    enable_tcp=True,   # Enable TCP transport (default)
-    enable_quic=True,  # Enable QUIC transport
-    quic_port=1884,   # UDP port for QUIC
-    quic_certfile="cert.pem",  # TLS certificate (required for QUIC)
-    quic_keyfile="key.pem",    # TLS private key (required for QUIC)
+    enable_tcp=False,
+    enable_quic=True,
+    quic_port=1884,
+    quic_certfile="cert.pem",
+    quic_keyfile="key.pem",
 )
 
 @app.subscribe("sensors/#")
-async def handle_sensor(topic: str, client: MQTTClient):
-    """Handle sensor messages"""
+async def on_sensor(topic: str, client: MQTTClient):
     print(f"[{client.client_id}] Subscribed to {topic}")
 
-@app.publish_handler("sensors/temperature")
-async def handle_temperature(message: MQTTMessage, client: MQTTClient):
-    """Handle temperature publishes"""
-    print(f"Temperature from {client.client_id}: {message.payload_str}")
-
-if __name__ == "__main__":
-    print("Starting MQTT server with both TCP and QUIC...")
-    print("TCP: mqtt://localhost:1883")
-    print("QUIC: quic://localhost:1884")
-    app.run()
+app.run()
 ```
 
-### MQTT over QUIC Server (QUIC-Only Mode)
+### Shared subscriptions (MQTT 5.0)
+
+Clients subscribe with `$share/groupname/topic`. Server delivers each message to one member of the group (round-robin).
 
 ```python
-from mqttd import MQTTApp, MQTTMessage, MQTTClient
+app = MQTTApp(port=1883)
 
-# Create MQTT app with QUIC-only mode (TCP disabled)
-app = MQTTApp(
-    enable_tcp=False,  # Disable TCP transport
-    enable_quic=True,   # Enable QUIC transport (ngtcp2)
-    quic_port=1884,    # UDP port for QUIC
-    quic_certfile="cert.pem",  # TLS certificate (required for QUIC)
-    quic_keyfile="key.pem",    # TLS private key (required for QUIC)
-)
+@app.subscribe("$share/workers/commands")
+async def on_shared(topic: str, client: MQTTClient):
+    print(f"Shared sub: {client.client_id} -> {topic}")
 
-@app.subscribe("sensors/#")
-async def handle_sensor(topic: str, client: MQTTClient):
-    """Handle sensor messages"""
-    print(f"[{client.client_id}] Subscribed to {topic}")
-
-@app.publish_handler("sensors/temperature")
-async def handle_temperature(message: MQTTMessage, client: MQTTClient):
-    """Handle temperature publishes"""
-    print(f"Temperature from {client.client_id}: {message.payload_str}")
-
-if __name__ == "__main__":
-    print("Starting MQTT server in QUIC-only mode...")
-    print("QUIC: quic://localhost:1884")
-    print("Note: TCP connections are disabled")
-    app.run()
+app.run()
 ```
 
-### With Configuration File
+### Configuration file
 
-Create a `mqttd.config` file:
+Create `mqttd.config`:
 
 ```
 version 5
-Testnum 1190
 ```
-
-Then use it:
 
 ```python
 app = MQTTApp(port=1883, config_file="mqttd.config")
 app.run()
 ```
 
-## ⚙️ Configuration Options
+---
 
-### MQTTApp Initialization Parameters
+## Configuration Options
 
 ```python
 MQTTApp(
-    host="0.0.0.0",                    # Host to bind to
-    port=1883,                         # Port to listen on
-    ssl_context=None,                  # SSL context for MQTTS (optional)
-    config_file=None,                  # Path to configuration file (optional)
-    
-    # Redis Configuration (optional)
-    redis_host=None,                   # Redis server host (None = no Redis)
-    redis_port=6379,                   # Redis server port
-    redis_db=0,                        # Redis database number
-    redis_password=None,               # Redis password (optional)
-    redis_url=None,                    # Redis connection URL (overrides above)
-    use_redis=False,                   # Enable Redis pub/sub backend
-    
-    # Transport Configuration
-    enable_tcp=True,                    # Enable TCP transport (default: True)
-    enable_quic=False,                 # Enable QUIC/HTTP3 transport (default: False)
-    quic_port=1884,                    # UDP port for QUIC server
-    quic_certfile=None,                # Path to TLS certificate for QUIC
-    quic_keyfile=None,                 # Path to TLS private key for QUIC
-    
-    # Connection Limits (optional)
-    max_connections=None,              # Maximum total connections (None = unlimited)
-    max_connections_per_ip=None,      # Maximum connections per IP address
-    max_messages_per_second=None,     # Rate limit for messages per second per client
-    max_subscriptions_per_minute=None # Rate limit for subscriptions per minute per client
+    host="0.0.0.0",
+    port=1883,
+    ssl_context=None,
+    config_file=None,
+    redis_host=None,
+    redis_port=6379,
+    redis_db=0,
+    redis_password=None,
+    redis_url=None,
+    use_redis=False,
+    enable_tcp=True,
+    enable_quic=False,
+    quic_port=1884,
+    quic_certfile=None,
+    quic_keyfile=None,
+    max_connections=None,
+    max_connections_per_ip=None,
+    max_messages_per_second=None,
+    max_subscriptions_per_minute=None,
 )
 ```
 
-### Configuration File Options
+---
 
-The configuration file supports the following options (similar to C reference):
+## API Reference (Summary)
 
-- `version` - MQTT protocol version (default: 5 for MQTT 5.0, 4 for MQTT 3.1.1)
-- `PUBLISH-before-SUBACK` - Send PUBLISH before SUBACK (for testing)
-- `short-PUBLISH` - Send truncated PUBLISH messages (for error testing)
-- `error-CONNACK` - Set CONNACK return code (0=accepted, 5=not authorized, etc.)
-- `excessive-remaining` - Send invalid remaining length (for protocol error testing)
-- `Testnum` - Test number for loading test-specific data
+- **`@app.subscribe(topic, qos=0)`** — Subscription handler; optional return bytes to send to subscriber.
+- **`@app.publish_handler(topic=None)`** — PUBLISH handler; `topic` filter or all if `None`.
+- **`app.run(host=None, port=None, ssl_context=None)`** — Blocking run.
+- **`app.get_metrics()`** — Dict of server metrics.
+- **`app.health_check()`** — Dict with status, running, connections, redis_connected, errors.
+- **`app.shutdown(timeout=30.0)`** — Graceful shutdown (async).
+- **`app.publish(topic, payload, qos=0, retain=False)`** — Programmatic publish (async; when Redis used).
+- **`app.publish_to_client(client, topic, payload, qos=0, retain=False)`** — Send PUBLISH to one client (async).
 
-## 📚 API Reference
+**Types:** `MQTTMessage` (topic, payload, qos, retain, packet_id, payload_str, payload_json), `MQTTClient` (client_id, username, password, keepalive, clean_session, address).
 
-### MQTTApp
+---
 
-Main application class for creating MQTT servers.
+## Architecture (Summary)
 
-#### Methods
+- **Multiple clients**: One asyncio task per connection; `_clients` dict; SessionManager per ClientID.
+- **Routing**: Direct (in-memory trie) or Redis pub/sub; optional MCP flow via Redis keys/channels.
+- **Thread-safety**: ThreadSafeTopicTrie (and related structures in `thread_safe.py`) for no-GIL readiness.
+- **Protocols**: CONNECT/CONNACK, PUBLISH, PUBACK/PUBREC/PUBREL/PUBCOMP, SUBSCRIBE/SUBACK, UNSUBSCRIBE/UNSUBACK, PINGREQ/PINGRESP, DISCONNECT.
 
-##### `subscribe(topic: str, qos: int = 0)`
+---
 
-Decorator for topic subscriptions.
+## Examples
 
-**Parameters:**
-- `topic`: MQTT topic pattern (supports wildcards: `+` for single level, `#` for multi-level)
-- `qos`: Quality of Service level (0, 1, or 2)
+See `examples/`:
 
-**Example:**
-```python
-@app.subscribe("sensors/temperature", qos=1)
-async def handle_temp(topic: str, client: MQTTClient):
-    print(f"Subscribed to {topic}")
-    # Optional: return bytes to send to subscribing client
-    return b"Welcome message"
-```
+- `basic_server.py` — Basic MQTT server
+- `mqtt5_server.py` — MQTT 5.0
+- `secure_server.py` — MQTTS
+- `redis_server.py` — Redis pub/sub
+- `direct_routing_server.py` — Direct routing
+- `mqtt_quic_server.py` / `mqtt_quic_only_server.py` — QUIC
+- `config_server.py` — Config file
 
-##### `publish_handler(topic: Optional[str] = None)`
+---
 
-Decorator for PUBLISH message handlers.
-
-**Parameters:**
-- `topic`: Optional topic filter. If `None`, handles all PUBLISH messages.
-
-**Example:**
-```python
-@app.publish_handler("sensors/+")
-async def handle_publish(message: MQTTMessage, client: MQTTClient):
-    print(f"Received: {message.topic} = {message.payload_str}")
-```
-
-##### `run(host: Optional[str] = None, port: Optional[int] = None, ssl_context: Optional[ssl.SSLContext] = None)`
-
-Run the server (blocking call).
-
-**Parameters:**
-- `host`: Override host (default: uses initialization value)
-- `port`: Override port (default: uses initialization value)
-- `ssl_context`: Override SSL context (default: uses initialization value)
-
-##### `async publish(topic: str, payload: bytes, qos: int = 0, retain: bool = False)`
-
-Publish message programmatically (when using Redis mode).
-
-**Parameters:**
-- `topic`: Topic to publish to
-- `payload`: Message payload (bytes)
-- `qos`: Quality of Service level (0, 1, or 2)
-- `retain`: Retain flag
-
-### Types
-
-#### `MQTTMessage`
-
-Represents an MQTT message.
-
-**Attributes:**
-- `topic: str` - Message topic
-- `payload: bytes` - Message payload
-- `qos: int` - Quality of Service level
-- `retain: bool` - Retain flag
-- `packet_id: Optional[int]` - Packet ID (for QoS > 0)
-
-**Properties:**
-- `payload_str: str` - Payload as UTF-8 string
-- `payload_json: Any` - Payload parsed as JSON
-
-#### `MQTTClient`
-
-Represents a connected MQTT client.
-
-**Attributes:**
-- `client_id: str` - Client identifier
-- `username: Optional[str]` - Username
-- `password: Optional[str]` - Password
-- `keepalive: int` - Keepalive interval in seconds
-- `clean_session: bool` - Clean session flag
-- `address: Optional[tuple]` - Client address (host, port)
-
-#### `QoS`
-
-Quality of Service enumeration:
-- `QoS.AT_MOST_ONCE = 0`
-- `QoS.AT_LEAST_ONCE = 1`
-- `QoS.EXACTLY_ONCE = 2`
-
-## 🏗️ Architecture
-
-### Two Routing Modes
-
-#### 1. Direct Routing (Default - No Redis)
-
-**Message Flow:**
-```
-Client A (PUBLISH) → Server → Direct lookup → Client B, C, D (receive)
-```
-
-**Characteristics:**
-- **Lower latency**: No Redis network hop
-- **Simpler**: No external dependencies
-- **Single server**: All clients must connect to the same server
-- **In-memory**: Direct routing within the server process
-- **Thread-safe**: Uses thread-safe topic trie for O(m) subscription lookup
-
-#### 2. Redis Pub/Sub (Optional - For Scaling)
-
-**Message Flow:**
-```
-Client A (PUBLISH) → Server → Redis Channel → Redis broadcasts → Server → Client B, C, D
-```
-
-**Characteristics:**
-- **Scalable**: Multiple servers can share the same Redis
-- **Distributed**: Messages flow across server boundaries
-- **High availability**: If one server dies, others continue
-- **Slightly higher latency**: One extra network hop to Redis
-
-**When to use each:**
-- **Direct Routing**: Single server, maximum performance, simplicity
-- **Redis Pub/Sub**: Multiple servers, horizontal scaling, high availability
-
-### Protocol Support
-
-The server implements the following MQTT message types:
-
-- **CONNECT / CONNACK** - Client connection
-- **PUBLISH** - Message publishing
-- **PUBACK / PUBREC / PUBREL / PUBCOMP** - QoS 1 and 2 acknowledgments
-- **SUBSCRIBE / SUBACK** - Topic subscriptions
-- **UNSUBSCRIBE / UNSUBACK** - Unsubscribe from topics
-- **PINGREQ / PINGRESP** - Keepalive
-- **DISCONNECT** - Client disconnection
-
-### MQTT 5.0 Features
-
-- **Automatic Protocol Detection**: Handles both MQTT 3.1.1 and 5.0 clients
-- **Properties System**: Full encoding/decoding for all 32 property types
-- **Reason Codes**: All reason codes for all packet types
-- **Session Management**: Proper session handling with expiry and takeover
-- **Flow Control**: Receive Maximum and Maximum Packet Size negotiation
-
-### No-GIL Support
-
-The package is compatible with Python 3.13+ no-GIL mode (`--disable-gil` flag) for true parallelism:
-
-- **True Parallelism**: Multiple threads can execute Python code simultaneously
-- **Better CPU Utilization**: All CPU cores can be used efficiently
-- **Simpler Architecture**: Single process instead of multi-process
-- **Lower Memory Overhead**: Shared memory instead of process duplication
-
-## 🧪 Testing
-
-### Running Tests
+## Testing
 
 ```bash
-# Run basic tests
-python tests/test_basic.py
-
-# Run all tests
-pytest tests/
-
-# Run with verbose output
+python tests/test_new_features.py
+# or
 pytest tests/ -v
 ```
 
-### Testing with libcurl
+---
 
-The server is compatible with libcurl's MQTT implementation:
+## License
 
-```bash
-# Publish a message
-curl --mqtt-pub "sensors/temp" --data "25.5" mqtt://localhost:1883
+MIT License.
 
-# Subscribe to a topic
-curl --mqtt-sub "sensors/temp" mqtt://localhost:1883
-```
-
-## 📖 Examples
-
-See the `examples/` directory for complete examples:
-
-- `basic_server.py` - Basic MQTT server
-- `mqtt5_server.py` - MQTT 5.0 server
-- `secure_server.py` - MQTTS (TLS) server
-- `redis_server.py` - Redis pub/sub backend
-- `direct_routing_server.py` - Direct routing mode
-- `mqtt_quic_server.py` - QUIC transport
-- `config_server.py` - Configuration file usage
-
-## 🔧 Development
-
-### Project Structure
-
-```
-mqttd/
-├── __init__.py              # Package exports
-├── app.py                   # Main MQTTApp class
-├── protocol.py              # MQTT 3.1.1 protocol
-├── protocol_v5.py           # MQTT 5.0 protocol
-├── properties.py            # MQTT 5.0 properties encoding/decoding
-├── reason_codes.py          # MQTT 5.0 reason codes
-├── session.py               # Session management
-├── types.py                 # Type definitions
-├── decorators.py            # FastAPI-like decorators
-├── thread_safe.py           # Thread-safe data structures
-├── transport_quic.py        # QUIC transport (aioquic)
-├── transport_quic_pure.py   # Pure Python QUIC
-├── transport_quic_ngtcp2.py # ngtcp2 QUIC bindings
-├── ngtcp2_bindings.py       # ngtcp2 C bindings
-└── ngtcp2_tls_bindings.py   # ngtcp2 TLS bindings
-
-examples/                    # Example servers
-tests/                       # Test suite
-docs/                        # Documentation
-```
-
-### Building from Source
-
-```bash
-git clone https://github.com/arusatech/mqttd.git
-cd mqttd
-pip install -e .
-```
-
-## 📄 License
-
-MIT License
-
-## 🤝 Contributing
-
-Contributions are welcome! Please feel free to submit a Pull Request.
-
-## 🔗 Links
+## Links
 
 - **Repository**: https://github.com/arusatech/mqttd
 - **Author**: Yakub Mohammad (yakub@arusatech.com)
-- **Version**: 0.2.0
-
-## 📝 Changelog
-
-### Version 0.2.0
-- Added MQTT 5.0 support with full backward compatibility
-- Added QUIC/HTTP3 transport support
-- Added session management with expiry
-- Added connection limits and rate limiting
-- Improved thread-safety with thread-safe topic trie
-- Added no-GIL Python compatibility
-
-### Version 0.1.0
-- Initial release
-- MQTT 3.1.1 support
-- FastAPI-like decorator API
-- Redis pub/sub backend
-- TLS/SSL support
+- **Version**: 0.5.0 (see pyproject.toml)
