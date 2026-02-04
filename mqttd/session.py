@@ -21,10 +21,13 @@ class SessionState(IntEnum):
 
 @dataclass
 class SessionSubscription:
-    """Represents a subscription within a session"""
+    """Represents a subscription within a session (MQTT 5.0 Subscription Options)."""
     topic: str
     qos: int
     subscription_id: Optional[int] = None
+    no_local: bool = False
+    retain_as_published: bool = False
+    retain_handling: int = 0  # 0=send retained+new, 1=new only, 2=send retained as new (RETAIN=0)
 
 
 @dataclass
@@ -102,12 +105,23 @@ class Session:
         self.active_socket = socket_obj
         self.active_writer = writer
     
-    def add_subscription(self, topic: str, qos: int, subscription_id: Optional[int] = None):
-        """Add or update subscription"""
+    def add_subscription(
+        self,
+        topic: str,
+        qos: int,
+        subscription_id: Optional[int] = None,
+        no_local: bool = False,
+        retain_as_published: bool = False,
+        retain_handling: int = 0,
+    ):
+        """Add or update subscription (MQTT 5.0 options optional)."""
         self.subscriptions[topic] = SessionSubscription(
             topic=topic,
             qos=qos,
-            subscription_id=subscription_id
+            subscription_id=subscription_id,
+            no_local=no_local,
+            retain_as_published=retain_as_published,
+            retain_handling=retain_handling,
         )
     
     def remove_subscription(self, topic: str):

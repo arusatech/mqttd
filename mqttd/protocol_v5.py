@@ -341,20 +341,86 @@ class MQTT5Protocol:
                 if isinstance(subscription_identifier, list):
                     subscription_identifier = subscription_identifier[0] if subscription_identifier else None
         
-        # Topic
-        topic, offset = MQTTProtocol.decode_string(data, offset)
-        
-        # QoS
-        if offset >= len(data):
-            raise ValueError("Insufficient data for QoS")
-        qos = data[offset] & 0x03
+        # Topic filters + Subscription Options (loop)
+        filters = []
+        while offset < len(data):
+            topic, offset = MQTTProtocol.decode_string(data, offset)
+            if offset >= len(data):
+                raise ValueError("Insufficient data for Subscription Options")
+            options_byte = data[offset]
+            offset += 1
+            # [MQTT-3.8.3-5] Reserved bits (6 and 7) MUST be 0
+            if (options_byte & 0xC0) != 0:
+                raise ValueError("SUBSCRIBE reserved bits in Subscription Options must be 0")
+            qos = options_byte & 0x03
+            no_local = bool(options_byte & 0x04)
+            retain_as_published = bool(options_byte & 0x08)
+            retain_handling = (options_byte >> 4) & 0x03  # 0, 1, or 2
+            if retain_handling == 3:
+                raise ValueError("Retain Handling value 3 is invalid")
+            filters.append({
+                'topic': topic,
+                'qos': qos,
+                'no_local': no_local,
+                'retain_as_published': retain_as_published,
+                'retain_handling': retain_handling,
+            })
         
         return {
             'packet_id': packet_id,
-            'topic': topic,
-            'qos': qos,
+            'filters': filters,
             'subscription_identifier': subscription_identifier,
             'properties': properties
+        }
+    
+    @staticmethod
+    def build_auth_v5(
+        reason_code: ReasonCode = ReasonCode.CONTINUE_AUTHENTICATION,
+        authentication_method: Optional[str] = None,
+        authentication_data: Optional[bytes] = None,
+        reason_string: Optional[str] = None,
+        user_properties: Optional[List[Tuple[str, str]]] = None,
+    ) -> bytes:
+        """Build AUTH packet (§3.15). Reason: 0x00 Success, 0x18 Continue authentication, 0x19 Re-authenticate."""
+        msg_type = MQTTMessageType.AUTH
+        properties = {}
+        if authentication_method is not None:
+            properties[PropertyType.AUTHENTICATION_METHOD] = authentication_method
+        if authentication_data is not None:
+            properties[PropertyType.AUTHENTICATION_DATA] = authentication_data
+        if reason_string:
+            properties[PropertyType.REASON_STRING] = reason_string
+        if user_properties:
+            properties[PropertyType.USER_PROPERTY] = user_properties
+        properties_bytes = PropertyEncoder.encode_properties(properties)
+        properties_length = MQTTProtocol.encode_remaining_length(len(properties_bytes))
+        variable_header = bytes([reason_code.value]) + properties_length + properties_bytes
+        remaining_length = len(variable_header)
+        remaining_length_bytes = MQTTProtocol.encode_remaining_length(remaining_length)
+        return bytes([msg_type]) + remaining_length_bytes + variable_header
+    
+    @staticmethod
+    def parse_auth_v5(data: bytes) -> Dict[str, Any]:
+        """Parse AUTH packet. Returns reason_code (int), authentication_method, authentication_data, properties."""
+        if len(data) < 1:
+            raise ValueError("Insufficient data for AUTH")
+        reason_code = data[0]
+        offset = 1
+        properties = {}
+        auth_method = None
+        auth_data = None
+        if offset < len(data):
+            prop_length, n = MQTTProtocol.decode_remaining_length(data, offset)
+            offset += n
+            if prop_length > 0 and offset + prop_length <= len(data):
+                properties, _ = PropertyEncoder.decode_properties(data[offset:offset + prop_length], 0)
+                auth_method = properties.get(PropertyType.AUTHENTICATION_METHOD)
+                auth_data = properties.get(PropertyType.AUTHENTICATION_DATA)
+        return {
+            'reason_code': reason_code,
+            'authentication_method': auth_method,
+            'authentication_data': auth_data,
+            'properties': properties,
         }
     
     @staticmethod

@@ -6,19 +6,20 @@ import asyncio
 import ssl
 import logging
 import struct
-from typing import Optional, Dict, List, Callable, Any, Tuple, Set
+import secrets
+from typing import Optional, Dict, List, Callable, Any, Tuple, Set, Union
 from pathlib import Path
 import socket
 
 from .protocol import (
     MQTTProtocol, MQTTMessageType, MQTTConnAckCode,
-    MQTTConnectFlags
+    MQTTConnectFlags,
 )
 from .protocol_v5 import MQTT5Protocol
 from .properties import PropertyEncoder, PropertyType
 from .reason_codes import ReasonCode, MQTT3_TO_MQTT5_REASON_CODE
 from .types import MQTTMessage, MQTTClient, QoS
-from .decorators import subscribe, publish_handler, topic_matches
+from .decorators import subscribe, publish_handler, topic_matches, parse_shared_subscription
 from .session import SessionManager, SessionState
 from .thread_safe import ThreadSafeTopicTrie
 
@@ -157,6 +158,14 @@ class MQTTApp:
         
         # Trie-based topic matching for O(m) lookup performance (m = topic depth)
         self._topic_trie = ThreadSafeTopicTrie()
+        # Shared subscriptions (MQTT 5.0): inner_filter -> (group_key, (sock, writer)); one delivery per group
+        self._shared_trie = ThreadSafeTopicTrie()
+        self._shared_groups: Dict[str, List[Tuple[socket.socket, asyncio.StreamWriter]]] = {}
+        self._shared_group_inner_filter: Dict[str, str] = {}  # group_key -> inner_filter
+        self._shared_group_index: Dict[str, int] = {}  # group_key -> round-robin index
+        
+        # Will Delay Interval: client_id -> asyncio.Task (cancel on reconnect)
+        self._pending_will_tasks: Dict[str, asyncio.Task] = {}
         
         # Retained messages: topic -> (payload, qos, retain)
         self._retained_messages: Dict[str, Tuple[bytes, int, bool]] = {}
@@ -327,8 +336,8 @@ class MQTTApp:
     
     async def _handle_connect(self, reader: asyncio.StreamReader,
                              writer: asyncio.StreamWriter,
-                             client_sock: socket.socket) -> Optional[MQTTClient]:
-        """Handle MQTT CONNECT message"""
+                             client_sock: socket.socket) -> Union[Optional[MQTTClient], Tuple[MQTTClient, Dict[str, Any]]]:
+        """Handle MQTT CONNECT. Returns client, or (client, connect_info) when enhanced auth required (MQTT 5.0)."""
         try:
             # Read fixed header
             msg_type, remaining_length, _ = await self._read_fixed_header(reader)
@@ -346,6 +355,17 @@ class MQTTApp:
             # Parse CONNECT
             connect_info = MQTTProtocol.parse_connect(payload_data)
             
+            # [MQTT-3.1.2-3] Reserved flag (bit 0) in Connect Flags MUST be 0
+            if (connect_info.get('connect_flags', 0) & 0x01) != 0:
+                protocol_level = connect_info.get('protocol_level', MQTTProtocol.PROTOCOL_LEVEL_5_0)
+                if protocol_level == MQTTProtocol.PROTOCOL_LEVEL_5_0:
+                    connack = MQTT5Protocol.build_connack_v5(reason_code=ReasonCode.MALFORMED_PACKET)
+                else:
+                    connack = MQTTProtocol.build_connack(MQTTConnAckCode.UNACCEPTABLE_PROTOCOL)
+                writer.write(connack)
+                await writer.drain()
+                return None
+            
             # Verify protocol name
             if connect_info['protocol_name'] != 'MQTT':
                 logger.warning("Invalid protocol name")
@@ -358,6 +378,17 @@ class MQTTApp:
             if not is_mqtt5 and protocol_level != MQTTProtocol.PROTOCOL_LEVEL_3_1_1:
                 logger.warning(f"Unsupported protocol level: {protocol_level}")
                 return None
+            
+            # §3.1/§3.2: Zero-length ClientID (MQTT 5.0) → server assigns and returns Assigned Client Identifier
+            assigned_client_identifier = None
+            client_id = connect_info.get('client_id') or ''
+            if is_mqtt5 and (client_id is None or client_id == ''):
+                assigned_client_identifier = 'mqttd-' + secrets.token_hex(8)
+                connect_info['client_id'] = assigned_client_identifier
+                client_id = assigned_client_identifier
+            elif not is_mqtt5 and (not client_id or client_id == ''):
+                # MQTT 3.1.1: zero-length ClientID is allowed but we still need an id for internal use
+                connect_info['client_id'] = 'mqttd-' + secrets.token_hex(8)
             
             # Extract session parameters (now properly parsed from CONNECT message)
             clean_start = connect_info.get('clean_start', connect_info.get('clean_session', True))
@@ -381,14 +412,39 @@ class MQTTApp:
             client_sock = writer.get_extra_info('socket')
             client._protocol_version = protocol_level  # Store for later use
             
+            # Cancel any pending Will for this client (reconnect within Will Delay Interval)
+            cid = connect_info['client_id']
+            existing = self._pending_will_tasks.pop(cid, None)
+            if existing is not None:
+                existing.cancel()
+                try:
+                    await existing
+                except asyncio.CancelledError:
+                    pass
+            
             # Handle session management (per MQTT 5.0 spec for concurrent connections)
             session, old_session_to_disconnect = self._session_manager.create_session(
-                client_id=connect_info['client_id'],
+                client_id=cid,
                 socket_obj=client_sock,
                 writer=writer,
                 clean_start=clean_start,
                 session_expiry_interval=session_expiry_interval
             )
+            
+            # Store Will message in session (for Will Delay Interval handling)
+            if connect_info.get('will_topic') and session:
+                cf = connect_info.get('connect_flags', 0)
+                will_qos = 2 if (cf & MQTTConnectFlags.WILL_QOS_2) else (1 if (cf & MQTTConnectFlags.WILL_QOS_1) else 0)
+                will_retain = bool(cf & MQTTConnectFlags.WILL_RETAIN)
+                will_props = connect_info.get('will_properties') or {}
+                will_delay = will_props.get(PropertyType.WILL_DELAY_INTERVAL, 0) or 0
+                session.will_message = {
+                    'topic': connect_info['will_topic'],
+                    'payload': connect_info.get('will_payload') or b'',
+                    'qos': will_qos,
+                    'retain': will_retain,
+                    'will_delay_interval': will_delay,
+                }
             
             # Disconnect old connection if session takeover occurred
             if old_session_to_disconnect and old_session_to_disconnect.active_writer:
@@ -478,20 +534,28 @@ class MQTTApp:
             if receive_maximum is not None:
                 self._flow_control[client_sock] = (0, receive_maximum)
             
+            # MQTT 5.0 enhanced authentication (§4.12): if CONNECT has Authentication Method, send AUTH first
+            connect_properties = connect_info.get('properties') or {}
+            auth_method = connect_properties.get(PropertyType.AUTHENTICATION_METHOD) if is_mqtt5 else None
+            if is_mqtt5 and auth_method:
+                auth_pkt = MQTT5Protocol.build_auth_v5(
+                    reason_code=ReasonCode.CONTINUE_AUTHENTICATION,
+                    authentication_method=auth_method,
+                )
+                writer.write(auth_pkt)
+                await writer.drain()
+                client._session = session
+                return (client, connect_info)
+            
             # Send CONNACK based on protocol version
             if is_mqtt5:
-                # MQTT 5.0 CONNACK with reason code
                 connack_reason_code = ReasonCode.SUCCESS
                 if self._config.get('error_connack'):
-                    # Map MQTT 3.1.1 return code to MQTT 5.0 reason code
                     mqtt3_code = self._config.get('error_connack')
                     connack_reason_code = MQTT3_TO_MQTT5_REASON_CODE.get(
                         mqtt3_code, ReasonCode.UNSPECIFIED_ERROR
                     )
-                
-                # Server's receive maximum (how many QoS > 0 messages we can receive from client)
-                server_receive_maximum = 65535  # Default
-                
+                server_receive_maximum = 65535
                 connack = MQTT5Protocol.build_connack_v5(
                     reason_code=connack_reason_code,
                     session_present=session_present,
@@ -499,33 +563,25 @@ class MQTTApp:
                     maximum_qos=2,
                     wildcard_subscription_available=1,
                     subscription_identifier_available=1,
-                    shared_subscription_available=0,  # Not implemented yet
-                    receive_maximum=server_receive_maximum  # Tell client our receive maximum
+                    shared_subscription_available=1,
+                    receive_maximum=server_receive_maximum,
+                    assigned_client_identifier=assigned_client_identifier
                 )
             else:
-                # MQTT 3.1.1 CONNACK
                 connack_code = self._config.get('error_connack', MQTTConnAckCode.ACCEPTED)
                 connack = MQTTProtocol.build_connack(connack_code)
             
             writer.write(connack)
             await writer.drain()
             
-            # Store client connection (legacy dict for compatibility)
             client_sock = writer.get_extra_info('socket')
             self._clients[client_sock] = (client, writer)
-            
-            # Track keepalive for this client
             keepalive_seconds = client.keepalive if client.keepalive > 0 else 60
             self._client_keepalive[client_sock] = (asyncio.get_event_loop().time(), keepalive_seconds, None)
-            
-            # Start keepalive monitoring task (TCP only; QUIC keep-alive is handled at transport level)
             if keepalive_seconds > 0 and isinstance(client_sock, socket.socket):
                 ping_task = asyncio.create_task(self._keepalive_monitor(client_sock, keepalive_seconds))
                 self._client_keepalive[client_sock] = (asyncio.get_event_loop().time(), keepalive_seconds, ping_task)
-            
-            # Link session to client
             client._session = session
-            
             return client
             
         except Exception as e:
@@ -621,67 +677,83 @@ class MQTTApp:
         """
         await self._forward_to_mqtt_clients(topic, payload, qos, subscription_identifiers, message_expiry_time)
     
-    async def _forward_to_mqtt_clients(self, topic: str, payload: bytes, qos: int = 0, 
+    async def _forward_to_mqtt_clients(self, topic: str, payload: bytes, qos: int = 0,
                                        subscription_identifiers: Optional[List[int]] = None,
-                                       message_expiry_time: Optional[float] = None):
+                                       message_expiry_time: Optional[float] = None,
+                                       publisher_sock: Optional[socket.socket] = None,
+                                       retain: bool = False):
         """
         Forward message to subscribed MQTT clients (used by both Redis and direct routing).
-        
-        Args:
-            topic: Topic name
-            payload: Message payload
-            qos: QoS level
-            subscription_identifiers: List of subscription IDs for MQTT 5.0
-            message_expiry_time: Absolute time when message expires (None = no expiry)
+        Applies MQTT 5.0 Subscription Options: No Local, Retain As Published.
         """
-        # Check message expiry before forwarding
         if message_expiry_time is not None:
             current_time = asyncio.get_event_loop().time()
             if current_time >= message_expiry_time:
                 logger.debug(f"Message expired, not forwarding: {topic}")
                 return
         
-        # Use Trie-based lookup for O(m) performance where m = topic depth
-        # This is much faster than O(n) where n = number of subscriptions
-        clients_to_notify = self._topic_trie.find_matching(topic)
-        
+        clients_to_notify = set(self._topic_trie.find_matching(topic))
+        # Shared subscriptions: one delivery per group (round-robin)
+        shared_matches = self._shared_trie.find_matching(topic)
+        if shared_matches:
+            by_group: Dict[str, List[Tuple[socket.socket, asyncio.StreamWriter]]] = {}
+            for group_key, client_info in shared_matches:
+                by_group.setdefault(group_key, []).append(client_info)
+            for group_key, members in by_group.items():
+                if not members:
+                    continue
+                idx = self._shared_group_index.get(group_key, 0)
+                self._shared_group_index[group_key] = (idx + 1) % len(members)
+                clients_to_notify.add(members[idx])
         if not clients_to_notify:
             logger.debug(f"No subscribers for topic: {topic}")
             return
         
-        # Send to all subscribed clients (build message per client for MQTT 5.0 subscription IDs)
         disconnected_clients = []
         for client_sock, writer in clients_to_notify:
             try:
-                # Get client object to check protocol version
                 client_obj = None
                 if client_sock in self._clients:
                     client_obj, _ = self._clients[client_sock]
                 
-                # Build PUBLISH message (MQTT 5.0 with subscription IDs if applicable)
-                is_mqtt5 = client_obj and hasattr(client_obj, '_protocol_version') and client_obj._protocol_version == MQTTProtocol.PROTOCOL_LEVEL_5_0
+                # No Local: skip if this subscriber is the publisher and has no_local on any matching sub
+                if publisher_sock is not None and client_sock == publisher_sock and client_obj and client_obj._session:
+                    skip = False
+                    for filter_topic, sub in client_obj._session.subscriptions.items():
+                        shared_parsed = parse_shared_subscription(filter_topic)
+                        pattern = shared_parsed[1] if shared_parsed else filter_topic
+                        if topic_matches(pattern, topic) and getattr(sub, 'no_local', False):
+                            skip = True
+                            break
+                    if skip:
+                        continue
                 
-                if is_mqtt5 and subscription_identifiers:
-                    # Find subscription IDs for this specific subscription
-                    sub_ids_for_client = []
-                    if client_obj and client_obj._session:
-                        # Get subscription ID from session for this topic
-                        subscription = client_obj._session.subscriptions.get(topic)
-                        if subscription and subscription.subscription_id:
-                            sub_ids_for_client = [subscription.subscription_id]
-                    
-                    # Build MQTT 5.0 PUBLISH with subscription identifiers
+                is_mqtt5 = client_obj and hasattr(client_obj, '_protocol_version') and client_obj._protocol_version == MQTTProtocol.PROTOCOL_LEVEL_5_0
+                sub_ids_for_client = []
+                retain_flag = retain  # MQTT 3.1.1 or no session: use original
+                if is_mqtt5 and client_obj and client_obj._session:
+                    any_rap = False
+                    for filter_topic, sub in client_obj._session.subscriptions.items():
+                        shared_parsed = parse_shared_subscription(filter_topic)
+                        pattern = shared_parsed[1] if shared_parsed else filter_topic
+                        if topic_matches(pattern, topic):
+                            if sub.subscription_id is not None:
+                                sub_ids_for_client.append(sub.subscription_id)
+                            if getattr(sub, 'retain_as_published', False):
+                                any_rap = True
+                    retain_flag = retain if any_rap else False
+                
+                if is_mqtt5:
                     publish_msg = MQTT5Protocol.build_publish_v5(
                         topic=topic,
                         payload=payload,
                         packet_id=None,
                         qos=qos,
-                        retain=False,
+                        retain=retain_flag,
                         subscription_identifiers=sub_ids_for_client if sub_ids_for_client else None
                     )
                 else:
-                    # MQTT 3.1.1 or no subscription IDs
-                    publish_msg = MQTTProtocol.build_publish(topic, payload, None, qos)
+                    publish_msg = MQTTProtocol.build_publish(topic, payload, None, qos, retain=retain_flag)
                 
                 writer.write(publish_msg)
                 await writer.drain()
@@ -690,7 +762,6 @@ class MQTTApp:
                 logger.debug(f"Failed to send to client {client_sock}: {e}")
                 disconnected_clients.append(client_sock)
         
-        # Clean up disconnected clients
         for client_sock in disconnected_clients:
             await self._unsubscribe_client(client_sock)
     
@@ -733,125 +804,146 @@ class MQTTApp:
             # Check if MQTT 5.0 client
             is_mqtt5 = hasattr(client, '_protocol_version') and client._protocol_version == MQTTProtocol.PROTOCOL_LEVEL_5_0
             
-            # Parse SUBSCRIBE (MQTT 5.0 with properties or MQTT 3.1.1)
-            if is_mqtt5:
-                subscribe_info = MQTT5Protocol.parse_subscribe_v5(data)
-            else:
-                subscribe_info = MQTTProtocol.parse_subscribe(data)
+            # Parse SUBSCRIBE (MQTT 5.0 with properties or MQTT 3.1.1; may have multiple filters)
+            try:
+                if is_mqtt5:
+                    subscribe_info = MQTT5Protocol.parse_subscribe_v5(data)
+                else:
+                    subscribe_info = MQTTProtocol.parse_subscribe(data)
+            except ValueError as e:
+                logger.warning(f"Malformed SUBSCRIBE: {e}")
+                if is_mqtt5:
+                    disconnect_msg = MQTT5Protocol.build_disconnect_v5(reason_code=ReasonCode.MALFORMED_PACKET)
+                    writer.write(disconnect_msg)
+                    await writer.drain()
+                raise ConnectionError("Malformed SUBSCRIBE") from e
             
-            topic = subscribe_info['topic']
             packet_id = subscribe_info['packet_id']
-            qos = subscribe_info['qos']
+            filters = subscribe_info['filters']
             subscription_identifier = subscribe_info.get('subscription_identifier') if is_mqtt5 else None
             
-            logger.info(f"SUBSCRIBE: topic={topic}, packet_id={packet_id}, qos={qos}, sub_id={subscription_identifier}")
+            logger.info(f"SUBSCRIBE: packet_id={packet_id}, filters={len(filters)}, sub_id={subscription_identifier}")
             
             client_sock = writer.get_extra_info('socket')
             
-            # Check subscription rate limiting
+            # Check subscription rate limiting (one check per SUBSCRIBE packet)
             if not self._check_rate_limit(client_sock, check_subscription=True):
-                # Rate limited - send error SUBACK
                 logger.warning(f"Subscription rate limited for client {client_sock}")
-                is_mqtt5 = hasattr(client, '_protocol_version') and client._protocol_version == MQTTProtocol.PROTOCOL_LEVEL_5_0
+                n = len(filters)
                 if is_mqtt5:
-                    suback = MQTT5Protocol.build_suback_v5(
-                        packet_id, 
-                        [ReasonCode.QUOTA_EXCEEDED]
-                    )
+                    suback = MQTT5Protocol.build_suback_v5(packet_id, [ReasonCode.QUOTA_EXCEEDED] * n)
                 else:
-                    suback = MQTTProtocol.build_suback(packet_id, 0x80)  # Error return code
+                    suback = MQTTProtocol.build_suback(packet_id, [0x80] * n)
                 writer.write(suback)
                 await writer.drain()
                 return False
             
-            # Subscribe to Redis channel (if using Redis)
-            if self.use_redis and self._redis_pubsub:
-                await self._redis_pubsub.subscribe(topic)
-                logger.info(f"Subscribed to Redis channel: {topic}")
+            granted_codes = []
+            granted_codes_mqtt3 = []
+            first_payload = None
+            first_payload_topic = None
+            first_payload_qos = 0
             
-            # Track MQTT client subscription (for both Redis and direct routing)
-            # Maintain legacy dict for backward compatibility
-            if topic not in self._topic_subscriptions:
-                self._topic_subscriptions[topic] = set()
-            self._topic_subscriptions[topic].add((client_sock, writer))
-            
-            # Add to Trie for O(m) lookup performance
-            self._topic_trie.insert(topic, (client_sock, writer))
-            
-            # Store subscription identifier in session (MQTT 5.0)
-            if is_mqtt5 and client._session and subscription_identifier:
-                client._session.add_subscription(topic, qos, subscription_identifier)
-            
-            # Find matching handlers
-            matching_handlers = []
-            for handler in self._subscribe_handlers:
-                if topic_matches(handler['topic'], topic):
-                    matching_handlers.append(handler)
-            
-            # Execute handlers (they can return payload to send)
-            payload = None
-            for handler_info in matching_handlers:
-                handler = handler_info['handler']
-                try:
-                    if asyncio.iscoroutinefunction(handler):
-                        result = await handler(topic, client)
+            for flt in filters:
+                topic = flt['topic']
+                qos = flt['qos']
+                shared = is_mqtt5 and parse_shared_subscription(topic)
+                # [MQTT-3.8.3-4] No Local on shared subscription is Protocol Error; reject this filter only
+                if shared and flt.get('no_local', False):
+                    if is_mqtt5:
+                        granted_codes.append(ReasonCode.IMPLEMENTATION_SPECIFIC_ERROR_SUB)
                     else:
-                        result = handler(topic, client)
-                    
-                    # Use first handler's result as payload
-                    if payload is None and result is not None:
-                        if isinstance(result, bytes):
-                            payload = result
-                        elif isinstance(result, str):
-                            payload = result.encode('utf-8')
-                except Exception as e:
-                    logger.debug(f"Handler error (non-fatal): {e}")
+                        granted_codes_mqtt3.append(0x80)
+                    continue
+                granted_qos = min(qos, 2)
+                if shared:
+                    share_name, inner_filter = shared
+                    group_key = topic  # full $share/ShareName/filter
+                if is_mqtt5:
+                    granted_codes.append([
+                        ReasonCode.GRANTED_QOS_0,
+                        ReasonCode.GRANTED_QOS_1,
+                        ReasonCode.GRANTED_QOS_2,
+                    ][granted_qos])
+                else:
+                    granted_codes_mqtt3.append(granted_qos)
+                
+                if self.use_redis and self._redis_pubsub:
+                    await self._redis_pubsub.subscribe(topic)
+                
+                if shared:
+                    # MQTT 5.0 shared subscription: one delivery per group (round-robin)
+                    if group_key not in self._shared_groups:
+                        self._shared_groups[group_key] = []
+                        self._shared_group_inner_filter[group_key] = inner_filter
+                    self._shared_groups[group_key].append((client_sock, writer))
+                    self._shared_trie.insert(inner_filter, (group_key, (client_sock, writer)))
+                else:
+                    if topic not in self._topic_subscriptions:
+                        self._topic_subscriptions[topic] = set()
+                    self._topic_subscriptions[topic].add((client_sock, writer))
+                    self._topic_trie.insert(topic, (client_sock, writer))
+                
+                if is_mqtt5 and client._session and subscription_identifier:
+                    client._session.add_subscription(
+                        topic, qos, subscription_identifier,
+                        no_local=flt.get('no_local', False),
+                        retain_as_published=flt.get('retain_as_published', False),
+                        retain_handling=flt.get('retain_handling', 0),
+                    )
+                elif not is_mqtt5 and client._session:
+                    client._session.add_subscription(topic, qos, None)
+                
+                handler_topic = (shared[1] if shared else topic)
+                for handler in self._subscribe_handlers:
+                    if topic_matches(handler['topic'], handler_topic):
+                        try:
+                            if asyncio.iscoroutinefunction(handler['handler']):
+                                result = await handler['handler'](topic, client)
+                            else:
+                                result = handler['handler'](topic, client)
+                            if first_payload is None and result is not None:
+                                first_payload = result.encode('utf-8') if isinstance(result, str) else result
+                                first_payload_topic = topic
+                                first_payload_qos = qos
+                        except Exception as e:
+                            logger.debug(f"Handler error (non-fatal): {e}")
             
-            # Send SUBACK (MQTT 5.0 with reason codes if applicable)
             if not self._config.get('publish_before_suback', False):
                 if is_mqtt5:
-                    granted_codes = [
-                        ReasonCode.GRANTED_QOS_0,
-                        ReasonCode.GRANTED_QOS_1,
-                        ReasonCode.GRANTED_QOS_2,
-                    ]
-                    suback = MQTT5Protocol.build_suback_v5(packet_id, [granted_codes[min(qos, 2)]])
+                    suback = MQTT5Protocol.build_suback_v5(packet_id, granted_codes)
                 else:
-                    suback = MQTTProtocol.build_suback(packet_id, 0)
+                    suback = MQTTProtocol.build_suback(packet_id, granted_codes_mqtt3)
                 writer.write(suback)
                 await writer.drain()
             
-            # Send PUBLISH if we have handlers (default payload if none returned)
-            if matching_handlers and payload:
-                publish_msg = MQTTProtocol.build_publish(topic, payload, packet_id, qos)
-                
+            if first_payload is not None and first_payload_topic:
+                publish_msg = MQTTProtocol.build_publish(first_payload_topic, first_payload, packet_id, first_payload_qos)
                 if self._config.get('short_publish', False):
-                    # Truncate for testing
                     publish_msg = publish_msg[:-2]
-                
                 writer.write(publish_msg)
                 await writer.drain()
-                logger.info(f"Published to {topic}")
+                logger.info(f"Published to {first_payload_topic}")
             
-            # Send SUBACK if not sent before
             if self._config.get('publish_before_suback', False):
                 if is_mqtt5:
-                    granted_codes = [
-                        ReasonCode.GRANTED_QOS_0,
-                        ReasonCode.GRANTED_QOS_1,
-                        ReasonCode.GRANTED_QOS_2,
-                    ]
-                    suback = MQTT5Protocol.build_suback_v5(packet_id, [granted_codes[min(qos, 2)]])
+                    suback = MQTT5Protocol.build_suback_v5(packet_id, granted_codes)
                 else:
-                    suback = MQTTProtocol.build_suback(packet_id, 0)
+                    suback = MQTTProtocol.build_suback(packet_id, granted_codes_mqtt3)
                 writer.write(suback)
                 await writer.drain()
             
-            # Deliver retained messages matching this subscription
-            await self._deliver_retained_messages(topic, client_sock, writer, qos)
+            for flt in filters:
+                sub_topic = flt['topic']
+                shared = is_mqtt5 and parse_shared_subscription(sub_topic)
+                deliver_filter = (shared[1] if shared else sub_topic)
+                await self._deliver_retained_messages(
+                    deliver_filter, client_sock, writer, flt['qos'],
+                    retain_handling=flt.get('retain_handling', 0),
+                    retain_as_published=flt.get('retain_as_published', False),
+                )
             
-            # Update metrics
-            self._metrics['total_subscriptions'] += 1
+            self._metrics['total_subscriptions'] += len(filters)
             
             return True
             
@@ -860,27 +952,37 @@ class MQTTApp:
             return False
     
     async def _unsubscribe_client(self, client_sock: socket.socket):
-        """Unsubscribe client from all topics"""
+        """Unsubscribe client from all topics (normal and shared)."""
         topics_to_remove = []
         client_writer = None
         
-        # Find all topics this client is subscribed to
-        for topic, subscriptions in self._topic_subscriptions.items():
+        # Find all topics this client is subscribed to (normal)
+        for topic, subscriptions in list(self._topic_subscriptions.items()):
             subscriptions_to_remove = []
             for sock, writer in subscriptions:
                 if sock == client_sock:
                     subscriptions_to_remove.append((sock, writer))
                     if client_writer is None:
                         client_writer = writer
-            
             for item in subscriptions_to_remove:
                 subscriptions.discard(item)
-                # Also remove from Trie
                 if client_writer:
                     self._topic_trie.remove(topic, item)
-            
             if not subscriptions:
                 topics_to_remove.append(topic)
+        
+        # Remove from shared subscriptions
+        for group_key, members in list(self._shared_groups.items()):
+            to_remove = [(sock, wr) for sock, wr in members if sock == client_sock]
+            for item in to_remove:
+                members.remove(item)
+                inner_filter = self._shared_group_inner_filter.get(group_key)
+                if inner_filter is not None:
+                    self._shared_trie.remove(inner_filter, (group_key, item))
+            if not members:
+                del self._shared_groups[group_key]
+                self._shared_group_inner_filter.pop(group_key, None)
+                self._shared_group_index.pop(group_key, None)
         
         # Unsubscribe from Redis if no more clients (only if using Redis)
         if self.use_redis and self._redis_pubsub:
@@ -1060,11 +1162,13 @@ class MQTTApp:
                     expiry_time = asyncio.get_event_loop().time() + message_expiry_interval
                 
                 await self._forward_to_mqtt_clients(
-                    message.topic, 
-                    message.payload, 
+                    message.topic,
+                    message.payload,
                     qos,
                     subscription_identifiers=getattr(message, '_subscription_identifiers', None),
-                    message_expiry_time=expiry_time
+                    message_expiry_time=expiry_time,
+                    publisher_sock=writer.get_extra_info('socket'),
+                    retain=message.retain,
                 )
             
             # Find matching handlers
@@ -1134,9 +1238,49 @@ class MQTTApp:
                 self._load_config()
             
             # Handle CONNECT
-            client = await self._handle_connect(reader, writer, client_sock)
-            if not client:
+            connect_result = await self._handle_connect(reader, writer, client_sock)
+            if connect_result is None:
                 return
+            if isinstance(connect_result, tuple):
+                client, auth_connect_info = connect_result
+                # Enhanced auth: expect AUTH or DISCONNECT only (§3.1.4)
+                try:
+                    msg_type, remaining_length, _ = await asyncio.wait_for(
+                        self._read_fixed_header(reader), timeout=30.0
+                    )
+                except (asyncio.TimeoutError, asyncio.IncompleteReadError):
+                    return
+                if msg_type == MQTTMessageType.DISCONNECT:
+                    logger.info("Client sent DISCONNECT during auth")
+                    return
+                if msg_type != MQTTMessageType.AUTH:
+                    logger.warning(f"Expected AUTH or DISCONNECT during auth, got {hex(msg_type)}")
+                    return
+                if remaining_length > 0:
+                    await reader.readexactly(remaining_length)
+                # Complete connection: send CONNACK and attach client
+                session_present = False
+                if not auth_connect_info.get('clean_start', True) and client._session and len(client._session.subscriptions) > 0:
+                    session_present = True
+                receive_maximum = (auth_connect_info.get('properties') or {}).get(PropertyType.RECEIVE_MAXIMUM, 65535)
+                self._flow_control[client_sock] = (0, receive_maximum)
+                connack = MQTT5Protocol.build_connack_v5(
+                    reason_code=ReasonCode.SUCCESS,
+                    session_present=session_present,
+                    retain_available=1, maximum_qos=2,
+                    wildcard_subscription_available=1, subscription_identifier_available=1,
+                    shared_subscription_available=1, receive_maximum=65535,
+                )
+                writer.write(connack)
+                await writer.drain()
+                self._clients[client_sock] = (client, writer)
+                keepalive_seconds = client.keepalive if client.keepalive > 0 else 60
+                self._client_keepalive[client_sock] = (asyncio.get_event_loop().time(), keepalive_seconds, None)
+                if keepalive_seconds > 0 and isinstance(client_sock, socket.socket):
+                    ping_task = asyncio.create_task(self._keepalive_monitor(client_sock, keepalive_seconds))
+                    self._client_keepalive[client_sock] = (asyncio.get_event_loop().time(), keepalive_seconds, ping_task)
+            else:
+                client = connect_result
             
             # Main message loop
             # Use keepalive timeout (with buffer) for TCP. For QUIC (non-socket),
@@ -1163,10 +1307,21 @@ class MQTTApp:
                         keepalive_seconds = self._client_keepalive[client_sock][1]
                         self._client_keepalive[client_sock] = (current_time, keepalive_seconds, self._client_keepalive[client_sock][2])
                     
-                    # Validate message type (must be valid MQTT message type)
-                    if msg_type == 0x00 or (msg_type & 0xF0) == 0xF0:
+                    # Validate message type (0xF0 = AUTH is valid for MQTT 5.0)
+                    if msg_type == 0x00 or ((msg_type & 0xF0) == 0xF0 and msg_type != MQTTMessageType.AUTH):
                         logger.warning(f"Invalid message type: {hex(msg_type)}")
                         break
+                    
+                    if msg_type == MQTTMessageType.AUTH:
+                        # Re-authentication (§4.12.1): optional; respond with AUTH Success or Continue
+                        if remaining_length > 0:
+                            auth_data = await reader.readexactly(remaining_length)
+                            auth_info = MQTT5Protocol.parse_auth_v5(auth_data)
+                            if auth_info.get('reason_code') == 0x19:  # Re-authenticate
+                                auth_resp = MQTT5Protocol.build_auth_v5(reason_code=ReasonCode.AUTH_SUCCESS)
+                                writer.write(auth_resp)
+                                await writer.drain()
+                        continue
                     
                     # Handle message based on type
                     if msg_type == MQTTMessageType.SUBSCRIBE:
@@ -1226,17 +1381,26 @@ class MQTTApp:
         except Exception as e:
             logger.error(f"Error handling client: {e}")
         finally:
-            # Unsubscribe client from all topics
+            client_id = self._clients[client_sock][0].client_id if client_sock in self._clients else None
             await self._unsubscribe_client(client_sock)
-            
-            # Remove client connection
             if client_sock in self._clients:
                 del self._clients[client_sock]
-            
-            # Handle session cleanup (per MQTT 5.0 spec)
             preserved_session = self._session_manager.remove_connection(client_sock)
             if preserved_session:
                 logger.info(f"Session preserved for ClientID {preserved_session.client_id} (expiry: {preserved_session.expiry_interval}s)")
+                will = preserved_session.will_message
+                if will and client_id:
+                    delay = will.get('will_delay_interval') or 0
+                    if delay > 0:
+                        task = asyncio.create_task(
+                            self._send_will_after_delay(client_id, delay, will)
+                        )
+                        self._pending_will_tasks[client_id] = task
+                    else:
+                        await self._forward_to_mqtt_clients(
+                            will['topic'], will['payload'], will['qos'],
+                            retain=will['retain'],
+                        )
             else:
                 logger.debug(f"Session removed for disconnected client")
             
@@ -1306,26 +1470,42 @@ class MQTTApp:
             
             # Remove subscriptions
             for topic in topics:
-                # Remove from legacy topic subscriptions dict
-                if topic in self._topic_subscriptions:
-                    subscriptions_to_remove = []
-                    for sock, wr in self._topic_subscriptions[topic]:
-                        if sock == client_sock:
-                            subscriptions_to_remove.append((sock, wr))
-                    
-                    for item in subscriptions_to_remove:
-                        self._topic_subscriptions[topic].discard(item)
-                    
-                    # Remove empty topic entries
-                    if not self._topic_subscriptions[topic]:
-                        del self._topic_subscriptions[topic]
-                        # Unsubscribe from Redis if using Redis
-                        if self.use_redis and self._redis_pubsub:
-                            await self._redis_pubsub.unsubscribe(topic)
-                            logger.debug(f"Unsubscribed from Redis channel: {topic}")
-                
-                # Remove from Trie
-                self._topic_trie.remove(topic, (client_sock, writer))
+                shared = parse_shared_subscription(topic)
+                if shared:
+                    group_key = topic
+                    inner_filter = self._shared_group_inner_filter.get(group_key)
+                    if group_key in self._shared_groups:
+                        members = self._shared_groups[group_key]
+                        item = None
+                        for (sock, wr) in members:
+                            if sock == client_sock:
+                                item = (sock, wr)
+                                break
+                        if item is not None:
+                            members.remove(item)
+                            if inner_filter is not None:
+                                self._shared_trie.remove(inner_filter, (group_key, item))
+                        if not members:
+                            del self._shared_groups[group_key]
+                            self._shared_group_inner_filter.pop(group_key, None)
+                            self._shared_group_index.pop(group_key, None)
+                    if self.use_redis and self._redis_pubsub:
+                        await self._redis_pubsub.unsubscribe(topic)
+                else:
+                    # Remove from legacy topic subscriptions dict
+                    if topic in self._topic_subscriptions:
+                        subscriptions_to_remove = []
+                        for sock, wr in self._topic_subscriptions[topic]:
+                            if sock == client_sock:
+                                subscriptions_to_remove.append((sock, wr))
+                        for item in subscriptions_to_remove:
+                            self._topic_subscriptions[topic].discard(item)
+                        if not self._topic_subscriptions[topic]:
+                            del self._topic_subscriptions[topic]
+                            if self.use_redis and self._redis_pubsub:
+                                await self._redis_pubsub.unsubscribe(topic)
+                                logger.debug(f"Unsubscribed from Redis channel: {topic}")
+                    self._topic_trie.remove(topic, (client_sock, writer))
                 
                 # Remove from session if exists
                 if client._session:
@@ -1341,16 +1521,13 @@ class MQTTApp:
                 # MQTT 5.0: Send UNSUBACK with reason codes (one per topic)
                 reason_codes = []
                 for topic in topics:
-                    # Check if subscription existed
-                    if topic in self._topic_subscriptions:
-                        # Check if client had this subscription
+                    had_subscription = False
+                    if parse_shared_subscription(topic):
+                        if topic in self._shared_groups:
+                            had_subscription = any(sock == client_sock for sock, _ in self._shared_groups[topic])
+                    elif topic in self._topic_subscriptions:
                         had_subscription = any(sock == client_sock for sock, _ in self._topic_subscriptions.get(topic, set()))
-                        if had_subscription:
-                            reason_codes.append(ReasonCode.SUCCESS_UNSUB)
-                        else:
-                            reason_codes.append(ReasonCode.NO_SUBSCRIPTION_EXISTED)
-                    else:
-                        reason_codes.append(ReasonCode.NO_SUBSCRIPTION_EXISTED)
+                    reason_codes.append(ReasonCode.SUCCESS_UNSUB if had_subscription else ReasonCode.NO_SUBSCRIPTION_EXISTED)
                 
                 unsuback = MQTT5Protocol.build_unsuback_v5(packet_id, reason_codes)
             else:
@@ -1414,24 +1591,42 @@ class MQTTApp:
         except Exception as e:
             logger.error(f"Error handling PUBREL: {e}")
     
+    async def _send_will_after_delay(self, client_id: str, delay: float, will: Dict[str, Any]):
+        """Send Will message after Will Delay Interval; cancelled if client reconnects."""
+        try:
+            await asyncio.sleep(delay)
+        except asyncio.CancelledError:
+            return
+        if self._pending_will_tasks.get(client_id) is None:
+            return
+        self._pending_will_tasks.pop(client_id, None)
+        await self._forward_to_mqtt_clients(
+            will['topic'], will['payload'], will['qos'],
+            retain=will['retain'],
+        )
+        logger.debug(f"Sent Will message for client {client_id} after {delay}s delay")
+    
     async def _deliver_retained_messages(self, subscribed_topic: str,
                                          client_sock: socket.socket,
                                          writer: asyncio.StreamWriter,
-                                         qos: int):
-        """Deliver retained messages matching the subscribed topic"""
+                                         qos: int,
+                                         retain_handling: int = 0,
+                                         retain_as_published: bool = False):
+        """Deliver retained messages matching the subscribed topic. MQTT 5.0: retain_handling 1=skip, 2=send as new (RETAIN=0), 0=send with RETAIN per retain_as_published."""
+        if retain_handling == 1:
+            return
+        send_retain = retain_as_published if retain_handling == 0 else False
         for topic, (payload, msg_qos, retain) in self._retained_messages.items():
-            # Use the minimum QoS between subscription and retained message
+            if not topic_matches(subscribed_topic, topic):
+                continue
             delivery_qos = min(qos, msg_qos)
-            
-            # Check if the retained topic matches the subscription pattern
-            if topic_matches(subscribed_topic, topic):
-                try:
-                    publish_msg = MQTTProtocol.build_publish(topic, payload, None, delivery_qos, retain=True)
-                    writer.write(publish_msg)
-                    await writer.drain()
-                    logger.debug(f"Delivered retained message for topic: {topic} to subscriber")
-                except Exception as e:
-                    logger.error(f"Error delivering retained message: {e}")
+            try:
+                publish_msg = MQTTProtocol.build_publish(topic, payload, None, delivery_qos, retain=send_retain)
+                writer.write(publish_msg)
+                await writer.drain()
+                logger.debug(f"Delivered retained message for topic: {topic} to subscriber")
+            except Exception as e:
+                logger.error(f"Error delivering retained message: {e}")
     
     async def _keepalive_monitor(self, client_sock: socket.socket, keepalive_seconds: int):
         """Monitor client keepalive and disconnect if inactive"""

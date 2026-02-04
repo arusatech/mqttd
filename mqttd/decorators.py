@@ -65,9 +65,29 @@ def publish_handler(topic: Optional[str] = None):
     return decorator
 
 
+def parse_shared_subscription(filter_topic: str):
+    """
+    Parse MQTT 5.0 shared subscription filter (§4.8.2).
+    Format: $share/{ShareName}/{filter}
+
+    Returns:
+        None if not a shared subscription, else (share_name: str, inner_filter: str).
+    """
+    if not filter_topic.startswith('$share/'):
+        return None
+    parts = filter_topic.split('/')
+    # $share / ShareName / [filter levels...]
+    if len(parts) < 3:
+        return None
+    share_name = parts[1]
+    inner_filter = '/'.join(parts[2:])
+    return (share_name, inner_filter)
+
+
 def topic_matches(pattern: str, topic: str) -> bool:
     """
     Check if a topic matches a pattern (supports MQTT wildcards).
+    MQTT §4.7: Topic Filters starting with # or + must NOT match Topic Names beginning with $.
     
     Args:
         pattern: Topic pattern with wildcards (+ for single level, # for multi-level)
@@ -76,6 +96,9 @@ def topic_matches(pattern: str, topic: str) -> bool:
     Returns:
         True if topic matches pattern
     """
+    # §4.7: Server MUST NOT match filters starting with wildcard to $ topic names
+    if topic.startswith('$') and (pattern.startswith('#') or pattern.startswith('+')):
+        return False
     if pattern == topic:
         return True
     

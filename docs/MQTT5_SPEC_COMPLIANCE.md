@@ -1,6 +1,6 @@
 # MQTT v5.0 Specification Compliance Checklist
 
-Reference: [OASIS MQTT v5.0](https://docs.oasis-open.org/mqtt/mqtt/v5.0/mqtt-v5.0.html)
+Reference: [OASIS MQTT v5.0](https://docs.oasis-open.org/mqtt/mqtt/v5.0/mqtt-v5.0.html). Server conformance: §7.1.1 MQTT Server conformance clause.
 
 ## Control Packets (§2.1.2)
 
@@ -20,7 +20,7 @@ Reference: [OASIS MQTT v5.0](https://docs.oasis-open.org/mqtt/mqtt/v5.0/mqtt-v5.
 | PINGREQ   | 12   | ✅     |       |
 | PINGRESP  | 13   | ✅     |       |
 | DISCONNECT| 14   | ✅     |       |
-| **AUTH**  | **15** | ❌   | Enhanced authentication not implemented |
+| **AUTH**  | **15** | ✅   | Packet type 15; CONNECT→AUTH→CONNACK flow and re-auth (§4.12.1) |
 
 ## CONNECT / CONNACK (§3.1, §3.2)
 
@@ -29,9 +29,9 @@ Reference: [OASIS MQTT v5.0](https://docs.oasis-open.org/mqtt/mqtt/v5.0/mqtt-v5.
 | Protocol name "MQTT", version 5 | ✅ | |
 | Connect flags (Clean Start, Will, User/Password) | ✅ | |
 | CONNECT properties (all 32 types) | ✅ | Encoded/decoded in `properties.py`, `protocol_v5.py` |
-| Zero-length ClientID → Assigned Client Identifier | ❌ | Server does not assign or return in CONNACK |
+| Zero-length ClientID → Assigned Client Identifier | ✅ | Server assigns unique ID and returns in CONNACK |
 | Will message + Will properties | ✅ | |
-| Will Delay Interval (scheduling/cancel on reconnect) | ❌ | Property present; delay/cancel logic not implemented |
+| Will Delay Interval (scheduling/cancel on reconnect) | ✅ | Delay + cancel on reconnect; `_pending_will_tasks`, `_send_will_after_delay` |
 | Session Expiry Interval, Clean Start | ✅ | Used in session manager |
 
 ## PUBLISH (§3.3)
@@ -49,21 +49,21 @@ Reference: [OASIS MQTT v5.0](https://docs.oasis-open.org/mqtt/mqtt/v5.0/mqtt-v5.
 | Feature | Status | Notes |
 |---------|--------|-------|
 | Packet ID, properties, Subscription Identifier | ✅ | |
-| **Multiple topic filters in one SUBSCRIBE** | ❌ | Only one topic parsed per packet |
-| **Subscription Options byte** | ❌ | No Local, Retain As Published, Retain Handling not parsed or applied |
-| SUBACK reason code per topic filter | ✅ | Builder supports list; single-topic only in practice |
+| **Multiple topic filters in one SUBSCRIBE** | ✅ | `parse_subscribe_v5` returns `filters` list; app iterates and SUBACK per filter |
+| **Subscription Options byte** | ✅ | No Local, Retain As Published, Retain Handling parsed and applied when forwarding |
+| SUBACK reason code per topic filter | ✅ | One reason code per filter; No Local on shared rejected with failure code |
 
 ## Shared Subscriptions (§4.8.2)
 
 | Feature | Status | Notes |
 |---------|--------|-------|
-| `$share/{ShareName}/{filter}` | ❌ | Not supported; CONNACK sends `shared_subscription_available=0` |
+| `$share/{ShareName}/{filter}` | ✅ | Supported; CONNACK sends `shared_subscription_available=1`; one delivery per group (round-robin) |
 
 ## UNSUBSCRIBE / UNSUBACK (§3.10, §3.11)
 
 | Feature | Status | Notes |
 |---------|--------|-------|
-| Multiple topic filters | ⚠️ | Verify parser returns list; UNSUBACK builder supports multiple reason codes |
+| Multiple topic filters | ✅ | Parser returns list; UNSUBACK with multiple reason codes |
 
 ## DISCONNECT (§3.14)
 
@@ -76,8 +76,8 @@ Reference: [OASIS MQTT v5.0](https://docs.oasis-open.org/mqtt/mqtt/v5.0/mqtt-v5.
 
 | Feature | Status | Notes |
 |---------|--------|-------|
-| AUTH packet type and exchange | ❌ | No AUTH in `MQTTMessageType` or handling |
-| CONNECT/CONNACK Auth Method/Data | ✅ | Properties only; no challenge/response flow |
+| AUTH packet type and exchange | ✅ | `MQTTMessageType.AUTH`; build/parse in `protocol_v5`; CONNECT→AUTH→CONNACK and re-auth in `app.py` |
+| CONNECT/CONNACK Auth Method/Data | ✅ | Properties; challenge/response flow enforced until CONNACK |
 
 ### Understanding AUTH from the spec (§3.15, §4.12)
 
@@ -113,12 +113,9 @@ Reference: [OASIS MQTT v5.0](https://docs.oasis-open.org/mqtt/mqtt/v5.0/mqtt-v5.
 
 - After CONNACK, the client may send **AUTH** with reason **0x19 (Re-authenticate)** and the same Authentication Method to start re-auth. The server responds with AUTH **0x00** (Success) or **0x18** (Continue). Other traffic may continue during re-auth.
 
-**What mqttd has vs what's missing**
+**What mqttd implements**
 
-- **Has:** CONNECT and CONNACK can carry **Authentication Method** and **Authentication Data** as properties (encode/decode in `properties.py` / `protocol_v5.py`).
-- **Missing:** AUTH as a packet type in `MQTTMessageType`; send/parse of AUTH; logic for CONNECT → AUTH → … → CONNACK (or reject); enforcement that the client sends only AUTH or DISCONNECT until CONNACK; re-authentication (AUTH 0x19) after connection.
-
-So enhanced authentication (challenge/response and re-auth) is **not implemented**; only the CONNECT/CONNACK properties for auth metadata exist.
+- CONNECT and CONNACK carry **Authentication Method** and **Authentication Data**; AUTH packet type 15 in `MQTTMessageType`; `build_auth_v5` / `parse_auth_v5` in `protocol_v5.py`; CONNECT→AUTH→…→CONNACK flow in `app.py` with enforcement that the client sends only AUTH or DISCONNECT until CONNACK; re-authentication (AUTH 0x19) after connection.
 
 ## Request/Response (§4.10)
 
@@ -132,7 +129,7 @@ So enhanced authentication (challenge/response and re-auth) is **not implemented
 | Feature | Status | Notes |
 |---------|--------|-------|
 | Wildcards `+`, `#` | ✅ | `decorators.topic_matches` |
-| **Topics starting with `$`** | ❌ | Filters starting with `#`/`+` must not match `$` topic names; not enforced |
+| **Topics starting with `$`** | ✅ | §4.7.2: `topic_matches` in `decorators.py` returns False when topic starts with `$` and pattern starts with `#` or `+` |
 
 ## Session (§4.1)
 
@@ -159,7 +156,7 @@ So enhanced authentication (challenge/response and re-auth) is **not implemented
 
 ## Summary
 
-- **Implemented:** CONNECT/CONNACK (except zero-length ClientID), PUBLISH with full properties, Topic Alias, Message Expiry, Session and flow control, Server DISCONNECT, Request/Response properties, wildcard topic matching, reason codes, and all property types.
-- **Not implemented or partial:** AUTH packet and enhanced auth, zero-length ClientID / Assigned Client Identifier, SUBSCRIBE multiple topic filters and Subscription Options (No Local, Retain As Published, Retain Handling), shared subscriptions, Will Delay Interval behavior, and topic `$` rule in matching.
+- **Implemented:** All control packets including AUTH (15); CONNECT/CONNACK with zero-length ClientID and Assigned Client Identifier; Will Delay Interval (delay and cancel on reconnect); SUBSCRIBE with multiple topic filters and Subscription Options (No Local, Retain As Published, Retain Handling); shared subscriptions (`$share/{ShareName}/{filter}`); topic `$` rule (§4.7.2); PUBLISH with full properties, Topic Alias, Message Expiry; Session and flow control; Server DISCONNECT; Request/Response properties; wildcard topic matching; reason codes; all property types. CONNECT reserved-flag validation and SUBSCRIBE reserved bits / Retain Handling 3 validation ensure malformed packets are rejected per §4.13.
+- **Normative checks:** CONNECT reserved flag (bit 0) must be 0 [MQTT-3.1.2-3]; SUBSCRIBE reserved bits (6–7) and Retain Handling value 3 rejected as malformed [MQTT-3.8.3-5]; No Local on shared subscription rejected with SUBACK failure for that filter [MQTT-3.8.3-4].
 
-To improve compliance: add AUTH handling, zero-length ClientID support, full SUBSCRIBE payload parsing (multiple filters + options), `$` rule in `topic_matches`, and Will Delay Interval scheduling.
+Compliance is aligned with §7.1.1 MQTT Server conformance clause.

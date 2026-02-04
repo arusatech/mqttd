@@ -128,10 +128,10 @@ def test_mqtt5_features():
     parsed_sub = MQTT5Protocol.parse_subscribe_v5(subscribe_data)
     assert parsed_sub['packet_id'] == 456
     sub_id = parsed_sub.get('subscription_identifier')
-    # Can be a single value or list (depending on decode implementation)
     assert sub_id == 10 or (isinstance(sub_id, list) and 10 in sub_id)
-    assert parsed_sub['topic'] == "test/topic"
-    assert parsed_sub['qos'] == 1
+    assert len(parsed_sub['filters']) == 1
+    assert parsed_sub['filters'][0]['topic'] == "test/topic"
+    assert parsed_sub['filters'][0]['qos'] == 1
     print("  ✓ MQTT 5.0 SUBSCRIBE with subscription identifier")
     
     # Test MQTT 5.0 UNSUBSCRIBE/UNSUBACK

@@ -7,7 +7,7 @@ Reference: https://docs.oasis-open.org/mqtt/mqtt/v5.0/mqtt-v5.0.html
 """
 
 import struct
-from typing import Tuple, Optional, Dict, Any, List
+from typing import Tuple, Optional, Dict, Any, List, Union
 from enum import IntEnum
 
 try:
@@ -36,6 +36,7 @@ class MQTTMessageType(IntEnum):
     PINGREQ = 0xC0
     PINGRESP = 0xD0
     DISCONNECT = 0xE0
+    AUTH = 0xF0  # MQTT 5.0 enhanced authentication (§3.15)
 
 
 class MQTTConnectFlags:
@@ -216,16 +217,17 @@ class MQTTProtocol:
         return bytes([msg_type]) + remaining_length_bytes + variable_header + payload
     
     @staticmethod
-    def build_suback(packet_id: int, return_code: int = 0) -> bytes:
-        """Build a SUBACK message"""
-        msg_type = MQTTMessageType.SUBACK
-        remaining_length = 3
+    def build_suback(packet_id: int, return_codes: Optional[Union[int, List[int]]] = None) -> bytes:
+        """Build a SUBACK message. return_codes: single int (one filter) or list of ints (one per filter)."""
+        if return_codes is None:
+            return_codes = 0
+        if isinstance(return_codes, int):
+            return_codes = [return_codes]
+        payload = bytes(return_codes)
+        remaining_length = 2 + len(payload)
         remaining_length_bytes = MQTTProtocol.encode_remaining_length(remaining_length)
-        
-        # Variable header: Packet Identifier + Return Code
-        variable_header = struct.pack('>H', packet_id) + bytes([return_code])
-        
-        return bytes([msg_type]) + remaining_length_bytes + variable_header
+        variable_header = struct.pack('>H', packet_id) + payload
+        return bytes([MQTTMessageType.SUBACK]) + remaining_length_bytes + variable_header
     
     @staticmethod
     def build_publish(topic: str, payload: bytes, packet_id: Optional[int] = None,
@@ -506,7 +508,7 @@ class MQTTProtocol:
     
     @staticmethod
     def parse_subscribe(data: bytes) -> Dict[str, Any]:
-        """Parse a SUBSCRIBE message"""
+        """Parse a SUBSCRIBE message (one or more topic filters; MQTT 3.1.1)."""
         offset = 0
         
         # Packet ID
@@ -515,18 +517,18 @@ class MQTTProtocol:
         packet_id = struct.unpack('>H', data[offset:offset+2])[0]
         offset += 2
         
-        # Topic
-        topic, offset = MQTTProtocol.decode_string(data, offset)
-        
-        # QoS
-        if offset >= len(data):
-            raise ValueError("Insufficient data for QoS")
-        qos = data[offset] & 0x03
+        filters = []
+        while offset < len(data):
+            topic, offset = MQTTProtocol.decode_string(data, offset)
+            if offset >= len(data):
+                raise ValueError("Insufficient data for QoS")
+            qos = data[offset] & 0x03
+            offset += 1
+            filters.append({'topic': topic, 'qos': qos})
         
         return {
             'packet_id': packet_id,
-            'topic': topic,
-            'qos': qos
+            'filters': filters
         }
     
     @staticmethod
