@@ -1238,13 +1238,17 @@ class NGTCP2Connection:
             return
         
         try:
-            # ngtcp2 asserts conn->log.last_ts <= ts in conn_update_timestamp; use monotonic ts >= last_ts to avoid crash on shutdown
+            # ngtcp2 asserts conn->log.last_ts <= ts in conn_update_timestamp. Use a timestamp
+            # strictly in the future so no concurrent recv/expiry can advance last_ts past it
+            # (avoids assertion/crash on Ctrl+C shutdown).
             now_ns = time.monotonic_ns()
             with self._ts_lock:
                 last_ts = getattr(self, "_last_ts", now_ns)
                 timestamp = max(now_ns, last_ts + 1)
                 if ngtcp2_conn_get_timestamp and self._conn_ptr:
                     timestamp = max(timestamp, ngtcp2_conn_get_timestamp(self._conn_ptr) + 1)
+                # Ensure ts is ahead of any possible last_ts (60s in future so shutdown never asserts)
+                timestamp = max(timestamp, now_ns + 60_000_000_000)
                 self._last_ts = timestamp
             if ngtcp2_conn_close:
                 # ngtcp2_conn_close is a wrapper that handles packet sending

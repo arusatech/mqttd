@@ -1476,6 +1476,10 @@ class MQTTApp:
                 except asyncio.IncompleteReadError:
                     logger.info("Client disconnected")
                     break
+                except (IndexError, ValueError) as e:
+                    # Stream reset or partial data can leave corrupt payloads; treat as disconnect
+                    logger.info("Client connection closed (stream reset or invalid data): %s", e)
+                    break
                 except Exception as e:
                     logger.error(f"Error in message loop: {e}")
                     break
@@ -1483,7 +1487,10 @@ class MQTTApp:
         except Exception as e:
             logger.error(f"Error handling client: {e}")
         finally:
-            client_id = self._clients[client_sock][0].client_id if client_sock in self._clients else None
+            try:
+                client_id = self._clients[client_sock][0].client_id if client_sock in self._clients else None
+            except (IndexError, KeyError):
+                client_id = None
             await self._unsubscribe_client(client_sock)
             if client_sock in self._clients:
                 del self._clients[client_sock]
