@@ -1409,11 +1409,14 @@ class QUICServerNGTCP2:
         logger.info(f"MQTT over QUIC server (ngtcp2) listening on {self.host}:{self.port} (UDP)")
     
     async def stop(self):
-        """Stop QUIC server"""
-        # Close all connections
+        """Stop QUIC server. On shutdown we only cleanup() connections to avoid ngtcp2
+        conn_update_timestamp assertion (conn->log.last_ts <= ts) which can trigger
+        when sending CONNECTION_CLOSE; clients will see connection drop."""
         for conn in list(self.connections.values()):
-            conn.close()
-            conn.cleanup()
+            try:
+                conn.cleanup()
+            except Exception as e:
+                logger.warning("Error cleaning up connection on stop: %s", e)
         self.connections.clear()
         
         if self.transport:
