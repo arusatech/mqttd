@@ -203,9 +203,10 @@ class MQTT5Protocol:
         """
         msg_type = MQTTMessageType.CONNACK
         
-        # Connect Acknowledge Flags
+        # Connect Acknowledge Flags [MQTT-3.2.2-1] Bits 7-1 reserved, MUST be 0. Bit 0 = Session Present.
+        # [MQTT-3.2.2-6] If Reason Code is non-zero (>= 0x80), Session Present MUST be 0.
         connack_flags = 0x00
-        if session_present:
+        if session_present and reason_code == ReasonCode.SUCCESS:
             connack_flags = 0x01
         
         # Properties
@@ -264,7 +265,16 @@ class MQTT5Protocol:
         remaining_length = len(variable_header)
         remaining_length_bytes = MQTTProtocol.encode_remaining_length(remaining_length)
         
-        return bytes([msg_type]) + remaining_length_bytes + variable_header
+        packet = bytes([msg_type]) + remaining_length_bytes + variable_header
+        # Validate CONNACK so client never waits for non-existent bytes (e.g. client timeout on 34 bytes)
+        decoded_rem, rem_bytes_consumed = MQTTProtocol.decode_remaining_length(packet, 1)
+        expected_total = 1 + rem_bytes_consumed + decoded_rem
+        if decoded_rem != remaining_length or expected_total != len(packet):
+            raise AssertionError(
+                "CONNACK encoding bug: decoded_rem=%s expected_rem=%s expected_total=%s len(packet)=%s"
+                % (decoded_rem, remaining_length, expected_total, len(packet))
+            )
+        return packet
     
     @staticmethod
     def build_suback_v5(

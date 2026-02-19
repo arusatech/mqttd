@@ -815,6 +815,18 @@ if NGTCP2_AVAILABLE and _ngtcp2_lib:
     except AttributeError:
         ngtcp2_conn_handle_expiry = None
         logger.warning("ngtcp2_conn_handle_expiry function not found")
+
+    # Must be called after ngtcp2_conn_writev_stream (and similar) so connection state advances for next packet
+    # C API: void ngtcp2_conn_update_pkt_tx_time(ngtcp2_conn *conn, ngtcp2_tstamp ts);
+    ngtcp2_conn_update_pkt_tx_time = None
+    try:
+        ngtcp2_conn_update_pkt_tx_time = lib.ngtcp2_conn_update_pkt_tx_time
+        ngtcp2_conn_update_pkt_tx_time.argtypes = [POINTER(ngtcp2_conn), c_uint64]
+        ngtcp2_conn_update_pkt_tx_time.restype = None
+        logger.debug("Loaded ngtcp2_conn_update_pkt_tx_time")
+    except AttributeError:
+        ngtcp2_conn_update_pkt_tx_time = None
+        logger.warning("ngtcp2_conn_update_pkt_tx_time not found")
     
     # Connection management - Close connection
     # Use ngtcp2_conn_write_connection_close_versioned (the actual function name)
@@ -1120,6 +1132,7 @@ else:
     ngtcp2_conn_read_pkt = None
     ngtcp2_conn_write_pkt = None
     ngtcp2_conn_handle_expiry = None
+    ngtcp2_conn_update_pkt_tx_time = None
     ngtcp2_conn_close = None
     ngtcp2_strm_recv = None
     ngtcp2_strm_write = None

@@ -342,7 +342,12 @@ class MQTTApp:
     async def _handle_connect(self, reader: asyncio.StreamReader,
                              writer: asyncio.StreamWriter,
                              client_sock: socket.socket) -> Union[Optional[MQTTClient], Tuple[MQTTClient, Dict[str, Any]]]:
-        """Handle MQTT CONNECT. Returns client, or (client, connect_info) when enhanced auth required (MQTT 5.0)."""
+        """Handle MQTT CONNECT. Returns client, or (client, connect_info) when enhanced auth required (MQTT 5.0).
+
+        [MQTT-3.2.0-1] The Server MUST send a CONNACK with Reason Code 0x00 (Success) before sending
+        any other packet type (except AUTH during enhanced authentication). This method only writes
+        CONNACK (or AUTH then return for enhanced auth); no PUBLISH, SUBACK, PINGRESP, etc.
+        """
         try:
             # Read fixed header
             msg_type, remaining_length, _ = await self._read_fixed_header(reader)
@@ -539,6 +544,7 @@ class MQTTApp:
             if receive_maximum is not None:
                 self._flow_control[client_sock] = (0, receive_maximum)
             
+            # [MQTT-3.2.0-1] Only AUTH (enhanced auth) or CONNACK may be sent before CONNACK Success.
             # MQTT 5.0 enhanced authentication (§4.12): if CONNECT has Authentication Method, send AUTH first
             connect_properties = connect_info.get('properties') or {}
             auth_method = connect_properties.get(PropertyType.AUTHENTICATION_METHOD) if is_mqtt5 else None
@@ -552,6 +558,7 @@ class MQTTApp:
                 client._session = session
                 return (client, connect_info)
             
+            # [MQTT-3.2.0-1] Send CONNACK with 0x00 (Success) before any other packet (PUBLISH, SUBACK, etc.)
             # Send CONNACK based on protocol version
             if is_mqtt5:
                 connack_reason_code = ReasonCode.SUCCESS
@@ -560,22 +567,33 @@ class MQTTApp:
                     connack_reason_code = MQTT3_TO_MQTT5_REASON_CODE.get(
                         mqtt3_code, ReasonCode.UNSPECIFIED_ERROR
                     )
+                # [MQTT-3.2.2-6] Session Present MUST be 0 when Reason Code >= 0x80
+                session_present_connack = session_present if connack_reason_code == ReasonCode.SUCCESS else False
                 server_receive_maximum = 65535
+                # Include common CONNACK properties per MQTT 5.0 §3.2.2.3 (all optional but commonly used)
                 connack = MQTT5Protocol.build_connack_v5(
                     reason_code=connack_reason_code,
-                    session_present=session_present,
+                    session_present=session_present_connack,
+                    session_expiry_interval=0,
                     retain_available=1,
                     maximum_qos=2,
+                    maximum_packet_size=65535,
+                    topic_alias_maximum=0,
                     wildcard_subscription_available=1,
                     subscription_identifier_available=1,
                     shared_subscription_available=1,
                     receive_maximum=server_receive_maximum,
+                    server_keep_alive=client.keepalive if client.keepalive and client.keepalive > 0 else 60,
                     assigned_client_identifier=assigned_client_identifier
                 )
             else:
                 connack_code = self._config.get('error_connack', MQTTConnAckCode.ACCEPTED)
                 connack = MQTTProtocol.build_connack(connack_code)
             
+            # Log CONNACK size and leading bytes for correlation with client (client must receive this exact length)
+            if logger.isEnabledFor(logging.DEBUG):
+                head = connack[:min(5, len(connack))]
+                logger.debug("Sending CONNACK len=%s first_bytes=%s", len(connack), head.hex())
             writer.write(connack)
             await writer.drain()
             
@@ -1360,6 +1378,7 @@ class MQTTApp:
                     return
                 if remaining_length > 0:
                     await reader.readexactly(remaining_length)
+                # [MQTT-3.2.0-1] Complete enhanced auth: send CONNACK (Success) before any other packet.
                 # Complete connection: send CONNACK and attach client
                 session_present = False
                 if not auth_connect_info.get('clean_start', True) and client._session and len(client._session.subscriptions) > 0:
@@ -1384,6 +1403,7 @@ class MQTTApp:
             else:
                 client = connect_result
             
+            # [MQTT-3.2.0-1] CONNACK (or AUTH then CONNACK) has been sent; now we may send other packets.
             # Main message loop
             # Use keepalive timeout (with buffer) for TCP. For QUIC (non-socket),
             # don't apply a read timeout; QUIC keep-alive runs at transport level.

@@ -37,7 +37,7 @@ try:
         ngtcp2_settings_default, ngtcp2_transport_params_default,
         ngtcp2_path_storage_init,
         ngtcp2_conn_server_new, ngtcp2_accept, ngtcp2_conn_read_pkt,
-        ngtcp2_conn_write_pkt, ngtcp2_conn_handle_expiry, ngtcp2_conn_close,
+        ngtcp2_conn_write_pkt, ngtcp2_conn_handle_expiry, ngtcp2_conn_update_pkt_tx_time, ngtcp2_conn_close,
         ngtcp2_conn_get_expiry, ngtcp2_conn_get_timestamp, ngtcp2_conn_get_handshake_completed, ngtcp2_conn_del,
         ngtcp2_conn_get_remote_transport_params, ngtcp2_conn_get_path,
         ngtcp2_conn_force_validate_path, ngtcp2_path_is_local_network,
@@ -64,7 +64,7 @@ except ImportError:
         ngtcp2_settings_default, ngtcp2_transport_params_default,
         ngtcp2_path_storage_init,
         ngtcp2_conn_server_new, ngtcp2_accept, ngtcp2_conn_read_pkt,
-        ngtcp2_conn_write_pkt, ngtcp2_conn_handle_expiry, ngtcp2_conn_close,
+        ngtcp2_conn_write_pkt, ngtcp2_conn_handle_expiry, ngtcp2_conn_update_pkt_tx_time, ngtcp2_conn_close,
         ngtcp2_conn_get_expiry, ngtcp2_conn_get_timestamp, ngtcp2_conn_get_handshake_completed, ngtcp2_conn_del,
         ngtcp2_conn_get_remote_transport_params, ngtcp2_conn_get_path,
         ngtcp2_conn_force_validate_path, ngtcp2_path_is_local_network,
@@ -260,8 +260,15 @@ class NGTCP2StreamWriter:
             self.connection.send_packets(timestamp)
     
     async def drain(self):
-        """Drain send buffer"""
-        await asyncio.sleep(0)  # Yield to event loop
+        """Drain send buffer so the client receives the full message (e.g. full CONNACK)."""
+        timeout = 5.0
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
+        while self.stream.send_buffer and loop.time() < deadline:
+            if hasattr(self.connection, 'conn') and self.connection.conn:
+                ts = time.monotonic_ns()
+                self.connection.send_packets(ts)
+            await asyncio.sleep(0.01)
     
     def close(self):
         """Close stream"""
@@ -414,8 +421,10 @@ class NGTCP2Connection:
             # Per RFC 9000 §10.1: the idle timeout is RESET whenever the server receives ANY
             # packet from the client (e.g. MQTT PINGREQ, PUBLISH, or QUIC ACKs). So client
             # activity or any message from the client resets the timeout; we only close if
-            # the client is silent for the full 120s.
-            self.transport_params.max_idle_timeout = 120 * NGTCP2_SECONDS
+            # the client is silent for the full period. Use 300s (5 min) so app backgrounding
+            # (e.g. Android) doesn't drop the connection before keepalive or resume.
+            _idle_sec = int(os.environ.get("MQTTD_QUIC_IDLE_TIMEOUT_SECONDS", "300"))
+            self.transport_params.max_idle_timeout = _idle_sec * NGTCP2_SECONDS
             # active_connection_id_limit in [2, 7]; keep 2 from default
             self.transport_params.active_connection_id_limit = 2
             # Ensure ngtcp2-valid defaults for params checked during handshake (in case default init was fallback)
@@ -738,6 +747,9 @@ class NGTCP2Connection:
                         stream.append_data(payload, fin=False)
                         if not getattr(conn_obj, "_logged_first_stream", False):
                             conn_obj._logged_first_stream = True
+                        if not getattr(stream, "_logged_first_recv", False):
+                            stream._logged_first_recv = True
+                            logger.info("QUIC stream data received: stream_id=%s len=%s (conn %s)", stream_id, len(payload), conn_obj.dcid.hex()[:8])
                         if ngtcp2_conn_extend_max_stream_offset:
                             ngtcp2_conn_extend_max_stream_offset(conn_obj._conn_ptr, stream_id, len(payload))
                         if ngtcp2_conn_extend_max_offset:
@@ -958,7 +970,52 @@ class NGTCP2Connection:
         except Exception as e:
             logger.error(f"Error receiving packet: {e}", exc_info=True)
             return False
-    
+
+    def _run_write_pkt_burst(self, max_packets: int = 3) -> None:
+        """Run write_pkt up to max_packets times (send control/ACK packets so next writev can proceed)."""
+        if not self._conn_ptr or not ngtcp2_conn_write_pkt:
+            return
+        now_ns = time.monotonic_ns()
+        timestamp = max(now_ns, getattr(self, '_last_ts', self.settings.initial_ts))
+        if ngtcp2_conn_get_timestamp and self._conn_ptr:
+            timestamp = max(timestamp, ngtcp2_conn_get_timestamp(self._conn_ptr))
+        self._last_ts = timestamp
+        sent = 0
+        with self._ts_lock:
+            while sent < max_packets:
+                if ngtcp2_conn_get_timestamp and self._conn_ptr:
+                    ts_to_pass = ngtcp2_conn_get_timestamp(self._conn_ptr) + 1
+                else:
+                    ts_to_pass = max(time.monotonic_ns(), timestamp, self._last_ts + 1)
+                self._last_ts = ts_to_pass
+                pkt_buf = (c_uint8 * MAX_UDP_PAYLOAD_SIZE)()
+                pktlen = c_size_t(0)
+                ts_c = c_uint64(ts_to_pass & 0xFFFFFFFFFFFFFFFF)
+                result = ngtcp2_conn_write_pkt(
+                    self._conn_ptr,
+                    byref(self.path_storage.path),
+                    pkt_buf,
+                    MAX_UDP_PAYLOAD_SIZE,
+                    byref(pktlen),
+                    ts_c,
+                )
+                if result < 0:
+                    break
+                pkt_len = pktlen.value
+                if pkt_len == 0 and result > 0:
+                    pkt_len = int(result)
+                if pkt_len <= 0:
+                    break
+                pkt_data = bytes(pkt_buf[:pkt_len])
+                self.server.send_packet(pkt_data, self.remote_addr)
+                sent += 1
+                self.packets_sent += 1
+                self.bytes_sent += pkt_len
+                self.last_io_at = time.time()
+                if ngtcp2_conn_get_timestamp and self._conn_ptr:
+                    self._last_ts = max(self._last_ts, ngtcp2_conn_get_timestamp(self._conn_ptr))
+                    timestamp = self._last_ts
+
     def send_packets(self, timestamp: Optional[int] = None) -> bool:
         """
         Send pending packets
@@ -969,54 +1026,130 @@ class NGTCP2Connection:
             return False
         
         try:
-            # Push any queued stream data into ngtcp2 before writing packets
+            # Push any queued stream data into ngtcp2; flush each stream fully so CONNACK etc. are sent in full
             for stream_id, stream in list(self.streams.items()):
                 if not stream.send_buffer:
                     continue
                 data = bytes(stream.send_buffer)
                 try:
                     if ngtcp2_conn_writev_stream_versioned:
-                        vec = ngtcp2_vec()
-                        data_array = (c_uint8 * len(data)).from_buffer_copy(data)
-                        vec.base = cast(data_array, POINTER(c_uint8))
-                        vec.len = len(data)
-                        with self._ts_lock:
-                            ts = time.monotonic_ns()
-                            if ngtcp2_conn_get_timestamp and self._conn_ptr:
-                                ts = max(ts, ngtcp2_conn_get_timestamp(self._conn_ptr) + 1)
-                            ts = max(ts, getattr(self, "_last_ts", 0) + 1)
-                            self._last_ts = ts
-                            pkt_buf = (c_uint8 * MAX_UDP_PAYLOAD_SIZE)()
-                            pdatalen = c_ssize_t(0)
-                            rv = ngtcp2_conn_writev_stream_versioned(
-                                self._conn_ptr,
-                                byref(self.path_storage.path),
-                                NGTCP2_PKT_INFO_V1,
-                                None,  # pkt_info
-                                pkt_buf,
-                                MAX_UDP_PAYLOAD_SIZE,
-                                byref(pdatalen),
-                                0,  # flags
-                                stream_id,
-                                byref(vec),
-                                1,  # datavcnt
-                                c_uint64(ts),
-                            )
-                        if rv > 0:
-                            pkt_len = int(rv)
-                            consumed = int(pdatalen.value)
-                            if consumed > 0:
-                                if consumed >= len(stream.send_buffer):
-                                    stream.send_buffer.clear()
+                        # Loop until this stream's send buffer is empty (client must see full CONNACK).
+                        # If writev returns 0 (congestion), run write_pkt burst and retry once so we send the second chunk.
+                        retry_after_zero = True
+                        while stream.send_buffer:
+                            data = bytes(stream.send_buffer)
+                            vec = ngtcp2_vec()
+                            data_array = (c_uint8 * len(data)).from_buffer_copy(data)
+                            vec.base = cast(data_array, POINTER(c_uint8))
+                            vec.len = len(data)
+                            with self._ts_lock:
+                                ts = time.monotonic_ns()
+                                if ngtcp2_conn_get_timestamp and self._conn_ptr:
+                                    ts = max(ts, ngtcp2_conn_get_timestamp(self._conn_ptr) + 1)
+                                ts = max(ts, getattr(self, "_last_ts", 0) + 1)
+                                self._last_ts = ts
+                                pkt_buf = (c_uint8 * MAX_UDP_PAYLOAD_SIZE)()
+                                pdatalen = c_ssize_t(0)
+                                rv = ngtcp2_conn_writev_stream_versioned(
+                                    self._conn_ptr,
+                                    byref(self.path_storage.path),
+                                    NGTCP2_PKT_INFO_V1,
+                                    None,  # pkt_info
+                                    pkt_buf,
+                                    MAX_UDP_PAYLOAD_SIZE,
+                                    byref(pdatalen),
+                                    0,  # flags
+                                    stream_id,
+                                    byref(vec),
+                                    1,  # datavcnt
+                                    c_uint64(ts),
+                                )
+                            if rv > 0:
+                                retry_after_zero = True  # reset for next time we have data
+                                pkt_len = int(rv)
+                                consumed = int(pdatalen.value) if pdatalen.value >= 0 else 0
+                                # Always send the packet (may contain STREAM and/or other frames)
+                                pkt_data = bytes(pkt_buf[:pkt_len])
+                                self.server.send_packet(pkt_data, self.remote_addr)
+                                self.packets_sent += 1
+                                self.bytes_sent += pkt_len
+                                self.last_io_at = time.time()
+                                if ngtcp2_conn_update_pkt_tx_time and self._conn_ptr:
+                                    ngtcp2_conn_update_pkt_tx_time(self._conn_ptr, ts)
+                                if consumed > 0:
+                                    if consumed >= len(stream.send_buffer):
+                                        stream.send_buffer.clear()
+                                    else:
+                                        del stream.send_buffer[:consumed]
+                                    remaining = len(stream.send_buffer)
+                                    logger.info(
+                                        "CONNACK flush: sent stream packet stream_id=%s pkt_len=%s consumed=%s remaining=%s",
+                                        stream_id, pkt_len, consumed, remaining,
+                                    )
+                                    self._run_write_pkt_burst(max_packets=3)
                                 else:
-                                    del stream.send_buffer[:consumed]
-                            pkt_data = bytes(pkt_buf[:pkt_len])
-                            self.server.send_packet(pkt_data, self.remote_addr)
-                            self.packets_sent += 1
-                            self.bytes_sent += pkt_len
-                            self.last_io_at = time.time()
-                        else:
-                            logger.debug("ngtcp2_conn_writev_stream_versioned failed: %s", rv)
+                                    break
+                            else:
+                                # writev returned 0 (congestion) or error; try burst + one retry so second CONNACK chunk gets sent
+                                if stream.send_buffer and retry_after_zero:
+                                    self._run_write_pkt_burst(max_packets=15)
+                                    retry_after_zero = False
+                                    # Retry writev once with same buffer
+                                    data = bytes(stream.send_buffer)
+                                    vec = ngtcp2_vec()
+                                    data_array = (c_uint8 * len(data)).from_buffer_copy(data)
+                                    vec.base = cast(data_array, POINTER(c_uint8))
+                                    vec.len = len(data)
+                                    with self._ts_lock:
+                                        ts = time.monotonic_ns()
+                                        if ngtcp2_conn_get_timestamp and self._conn_ptr:
+                                            ts = max(ts, ngtcp2_conn_get_timestamp(self._conn_ptr) + 1)
+                                        ts = max(ts, getattr(self, "_last_ts", 0) + 1)
+                                        self._last_ts = ts
+                                        pkt_buf = (c_uint8 * MAX_UDP_PAYLOAD_SIZE)()
+                                        pdatalen = c_ssize_t(0)
+                                        rv = ngtcp2_conn_writev_stream_versioned(
+                                            self._conn_ptr,
+                                            byref(self.path_storage.path),
+                                            NGTCP2_PKT_INFO_V1,
+                                            None,
+                                            pkt_buf,
+                                            MAX_UDP_PAYLOAD_SIZE,
+                                            byref(pdatalen),
+                                            0,
+                                            stream_id,
+                                            byref(vec),
+                                            1,
+                                            c_uint64(ts),
+                                        )
+                                    if rv > 0:
+                                        pkt_len = int(rv)
+                                        consumed = int(pdatalen.value) if pdatalen.value >= 0 else 0
+                                        pkt_data = bytes(pkt_buf[:pkt_len])
+                                        self.server.send_packet(pkt_data, self.remote_addr)
+                                        self.packets_sent += 1
+                                        self.bytes_sent += pkt_len
+                                        self.last_io_at = time.time()
+                                        if ngtcp2_conn_update_pkt_tx_time and self._conn_ptr:
+                                            ngtcp2_conn_update_pkt_tx_time(self._conn_ptr, ts)
+                                        if consumed > 0:
+                                            if consumed >= len(stream.send_buffer):
+                                                stream.send_buffer.clear()
+                                            else:
+                                                del stream.send_buffer[:consumed]
+                                            logger.info(
+                                                "CONNACK flush: sent stream packet (retry) stream_id=%s pkt_len=%s consumed=%s remaining=%s",
+                                                stream_id, pkt_len, consumed, len(stream.send_buffer),
+                                            )
+                                    break
+                                if rv != 0:
+                                    logger.debug("ngtcp2_conn_writev_stream_versioned rv=%s (congestion/limit ok)", rv)
+                                if stream.send_buffer:
+                                    logger.warning(
+                                        "CONNACK flush: stream_id=%s still has %s bytes (rv=%s); client may need second packet on next recv",
+                                        stream_id, len(stream.send_buffer), rv,
+                                    )
+                                break
                     elif ngtcp2_conn_submit_stream_data:
                         buf = (c_uint8 * len(data)).from_buffer_copy(data)
                         rv = ngtcp2_conn_submit_stream_data(self._conn_ptr, 0, stream_id, buf, len(data))
@@ -1221,6 +1354,7 @@ class NGTCP2Connection:
                 # Check all streams for data
                 for stream_id, stream in list(self.streams.items()):
                     if stream.has_data() and self.server.mqtt_handler:
+                        logger.info("QUIC invoking MQTT handler: stream_id=%s conn=%s", stream_id, self.dcid.hex()[:8])
                         # Process MQTT data on this stream
                         await self.server._handle_mqtt_over_quic(self, stream)
                 

@@ -311,6 +311,7 @@ if NGTCP2_AVAILABLE:
 SSL_CTX_new = None
 SSL_CTX_free = None
 SSL_CTX_use_certificate_file = None
+SSL_CTX_use_certificate_chain_file = None  # full chain (leaf + intermediates); avoids client "certificate verify failed"
 SSL_CTX_use_PrivateKey_file = None
 SSL_CTX_set_min_proto_version = None
 SSL_CTX_set_alpn_select_cb = None
@@ -370,6 +371,13 @@ if USE_OPENSSL and OPENSSL_AVAILABLE and _openssl_lib:
         SSL_CTX_use_certificate_file.restype = c_int
     except AttributeError:
         SSL_CTX_use_certificate_file = None
+    
+    try:
+        SSL_CTX_use_certificate_chain_file = ssl_lib.SSL_CTX_use_certificate_chain_file
+        SSL_CTX_use_certificate_chain_file.argtypes = [c_void_p, c_char_p]
+        SSL_CTX_use_certificate_chain_file.restype = c_int
+    except AttributeError:
+        SSL_CTX_use_certificate_chain_file = None
     
     try:
         SSL_CTX_use_PrivateKey_file = ssl_lib.SSL_CTX_use_PrivateKey_file
@@ -831,6 +839,7 @@ wolfSSL_CTX_new = None
 wolfSSL_CTX_free = None
 wolfTLSv1_3_server_method = None
 wolfSSL_CTX_use_certificate_file = None
+wolfSSL_CTX_use_certificate_chain_file = None  # full chain for client verification
 wolfSSL_CTX_use_PrivateKey_file = None
 ngtcp2_crypto_wolfssl_configure_server_context = None
 wolfSSL_new = None
@@ -856,7 +865,7 @@ WOLFSSL_FILETYPE_PEM = 1
 def _ensure_wolfssl_bound():
     """Ensure wolfSSL context-creation and ngtcp2_crypto_wolfssl_configure_server_context are bound."""
     global wolfSSL_CTX_new, wolfSSL_CTX_free, wolfTLSv1_3_server_method
-    global wolfSSL_CTX_use_certificate_file, wolfSSL_CTX_use_PrivateKey_file
+    global wolfSSL_CTX_use_certificate_file, wolfSSL_CTX_use_certificate_chain_file, wolfSSL_CTX_use_PrivateKey_file
     global ngtcp2_crypto_wolfssl_configure_server_context
     global wolfSSL_new, wolfSSL_free, wolfSSL_set_accept_state, wolfSSL_set_ex_data, wolfSSL_set_app_data
     global wolfSSL_set_quic_transport_version, wolfSSL_CTX_set_alpn_select_cb
@@ -890,6 +899,12 @@ def _ensure_wolfssl_bound():
         wolfSSL_CTX_use_certificate_file = w.wolfSSL_CTX_use_certificate_file
         wolfSSL_CTX_use_certificate_file.argtypes = [c_void_p, c_char_p, c_int]
         wolfSSL_CTX_use_certificate_file.restype = c_int
+    except AttributeError:
+        pass
+    try:
+        wolfSSL_CTX_use_certificate_chain_file = w.wolfSSL_CTX_use_certificate_chain_file
+        wolfSSL_CTX_use_certificate_chain_file.argtypes = [c_void_p, c_char_p]
+        wolfSSL_CTX_use_certificate_chain_file.restype = c_int
     except AttributeError:
         pass
     try:
@@ -960,7 +975,7 @@ def _ensure_wolfssl_bound():
 def _ensure_openssl_bound():
     """Ensure OpenSSL functions are bound - called lazily"""
     global TLS_server_method, SSL_CTX_new, SSL_CTX_free
-    global SSL_CTX_use_certificate_file, SSL_CTX_use_PrivateKey_file
+    global SSL_CTX_use_certificate_file, SSL_CTX_use_certificate_chain_file, SSL_CTX_use_PrivateKey_file
     global SSL_CTX_set_min_proto_version, SSL_CTX_set_alpn_select_cb
     global SSL_new, SSL_free, SSL_set_accept_state
     global SSL_set_app_data, SSL_get_app_data
@@ -1006,6 +1021,13 @@ def _ensure_openssl_bound():
         SSL_CTX_use_certificate_file = ssl_lib.SSL_CTX_use_certificate_file
         SSL_CTX_use_certificate_file.argtypes = [c_void_p, c_char_p, c_int]
         SSL_CTX_use_certificate_file.restype = c_int
+    except AttributeError:
+        pass
+    
+    try:
+        SSL_CTX_use_certificate_chain_file = ssl_lib.SSL_CTX_use_certificate_chain_file
+        SSL_CTX_use_certificate_chain_file.argtypes = [c_void_p, c_char_p]
+        SSL_CTX_use_certificate_chain_file.restype = c_int
     except AttributeError:
         pass
     
@@ -1124,7 +1146,8 @@ def create_server_tls_ctx(cert_file: str, key_file: str) -> Optional[c_void_p]:
                 pass
         if (
             wolfSSL_CTX_new and wolfTLSv1_3_server_method
-            and wolfSSL_CTX_use_certificate_file and wolfSSL_CTX_use_PrivateKey_file
+            and (wolfSSL_CTX_use_certificate_chain_file or wolfSSL_CTX_use_certificate_file)
+            and wolfSSL_CTX_use_PrivateKey_file
             and ngtcp2_crypto_wolfssl_configure_server_context
         ):
             try:
@@ -1136,9 +1159,13 @@ def create_server_tls_ctx(cert_file: str, key_file: str) -> Optional[c_void_p]:
                 if not ctx:
                     logger.error("wolfSSL_CTX_new() returned NULL")
                     return None
-                r = wolfSSL_CTX_use_certificate_file(ctx, cert_file.encode(), WOLFSSL_FILETYPE_PEM)
+                # Prefer full chain so client can verify (leaf-only causes "certificate verify failed")
+                if wolfSSL_CTX_use_certificate_chain_file:
+                    r = wolfSSL_CTX_use_certificate_chain_file(ctx, cert_file.encode())
+                else:
+                    r = wolfSSL_CTX_use_certificate_file(ctx, cert_file.encode(), WOLFSSL_FILETYPE_PEM)
                 if r != 1:
-                    logger.error(f"Failed to load certificate from {cert_file}")
+                    logger.error(f"Failed to load certificate (chain) from {cert_file}")
                     if wolfSSL_CTX_free:
                         wolfSSL_CTX_free(ctx)
                     return None
@@ -1210,8 +1237,15 @@ def create_server_tls_ctx(cert_file: str, key_file: str) -> Optional[c_void_p]:
             logger.error("SSL_CTX_new() returned NULL")
             return None
         
-        # Load certificate
-        if SSL_CTX_use_certificate_file:
+        # Load certificate (prefer full chain so client can verify; leaf-only causes "certificate verify failed")
+        if SSL_CTX_use_certificate_chain_file:
+            result = SSL_CTX_use_certificate_chain_file(ctx, cert_file.encode())
+            if result != 1:
+                logger.error(f"Failed to load certificate chain from {cert_file}")
+                if SSL_CTX_free:
+                    SSL_CTX_free(ctx)
+                return None
+        elif SSL_CTX_use_certificate_file:
             result = SSL_CTX_use_certificate_file(ctx, cert_file.encode(), SSL_FILETYPE_PEM)
             if result != 1:
                 logger.error(f"Failed to load certificate from {cert_file}")
