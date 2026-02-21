@@ -158,6 +158,9 @@ class NGTCP2Stream:
         
         # User data (for MQTT handler)
         self.user_data: Optional[Any] = None
+        
+        # Only run MQTT handler once per stream; prevents re-invoke on leftover data after DISCONNECT
+        self.mqtt_handler_started = False
     
     def append_data(self, data: bytes, fin: bool = False):
         """Append received stream data"""
@@ -334,6 +337,7 @@ class NGTCP2Connection:
         self.created_at = time.time()
         self.last_packet_at = time.time()
         self.last_io_at = time.time()
+        self.last_mqtt_activity = time.time()  # For app-level idle timeout
         
         # Path storage (must be valid for ngtcp2_conn_server_new - path must not be NULL)
         self.path_storage = ngtcp2_path_storage()
@@ -421,9 +425,10 @@ class NGTCP2Connection:
             # Per RFC 9000 §10.1: the idle timeout is RESET whenever the server receives ANY
             # packet from the client (e.g. MQTT PINGREQ, PUBLISH, or QUIC ACKs). So client
             # activity or any message from the client resets the timeout; we only close if
-            # the client is silent for the full period. Use 300s (5 min) so app backgrounding
-            # (e.g. Android) doesn't drop the connection before keepalive or resume.
-            _idle_sec = int(os.environ.get("MQTTD_QUIC_IDLE_TIMEOUT_SECONDS", "300"))
+            # the client is silent for the full period. Default 90s matches app idle timeout
+            # so force-quit/reopen reconnects quickly. Use MQTTD_QUIC_IDLE_TIMEOUT_SECONDS=300
+            # for longer backgrounding (e.g. Android app-switch).
+            _idle_sec = int(os.environ.get("MQTTD_QUIC_IDLE_TIMEOUT_SECONDS", "99"))
             self.transport_params.max_idle_timeout = _idle_sec * NGTCP2_SECONDS
             # active_connection_id_limit in [2, 7]; keep 2 from default
             self.transport_params.active_connection_id_limit = 2
@@ -749,7 +754,7 @@ class NGTCP2Connection:
                             conn_obj._logged_first_stream = True
                         if not getattr(stream, "_logged_first_recv", False):
                             stream._logged_first_recv = True
-                            logger.info("QUIC stream data received: stream_id=%s len=%s (conn %s)", stream_id, len(payload), conn_obj.dcid.hex()[:8])
+                            logger.debug("QUIC stream data received: stream_id=%s len=%s (conn %s)", stream_id, len(payload), conn_obj.dcid.hex()[:8])
                         if ngtcp2_conn_extend_max_stream_offset:
                             ngtcp2_conn_extend_max_stream_offset(conn_obj._conn_ptr, stream_id, len(payload))
                         if ngtcp2_conn_extend_max_offset:
@@ -934,10 +939,29 @@ class NGTCP2Connection:
             self.bytes_received += len(data)
             self.last_packet_at = time.time()
             self.last_io_at = time.time()
+            self.last_mqtt_activity = time.time()  # App-level idle timeout
             # ngtcp2 resets the connection idle timeout internally when a packet is successfully
             # processed (i.e. we reached here with result==0). So any client packet (PINGREQ,
-            # PUBLISH, or QUIC-level ACK) resets the 120s idle timer; timeout only fires if
-            # the client sends nothing for 120s.
+            # PUBLISH, or QUIC-level ACK) resets the idle timer for this device.
+
+            # Override peer max_idle_timeout on every packet so server's idle timeout
+            # applies instead of client's potentially shorter timeout (e.g. 60s). Per RFC 9000,
+            # the effective timeout is min(local, remote); setting remote to 0 = no limit.
+            # Doing this on every recv ensures that once we have communication, the close timer
+            # effectively resets to use the server's configured value.
+            if ngtcp2_conn_get_remote_transport_params:
+                try:
+                    rtp = ngtcp2_conn_get_remote_transport_params(self._conn_ptr)
+                    if rtp and getattr(rtp.contents, "max_idle_timeout", 0) > 0:
+                        rtp.contents.max_idle_timeout = 0
+                        if not self._remote_idle_overridden:
+                            self._remote_idle_overridden = True
+                            logger.info(
+                                "Overrode remote max_idle_timeout to 0 (use server idle) for %s",
+                                self.dcid.hex()[:8],
+                            )
+                except Exception as e:
+                    logger.debug("Could not override remote max_idle_timeout: %s", e)
 
             # Check if handshake completed
             if ngtcp2_conn_get_handshake_completed:
@@ -1022,7 +1046,7 @@ class NGTCP2Connection:
         
         Based on curl's cf_progress_egress
         """
-        if not self.conn:
+        if not self.conn or self.state == "closed":
             return False
         
         try:
@@ -1082,9 +1106,10 @@ class NGTCP2Connection:
                                     else:
                                         del stream.send_buffer[:consumed]
                                     remaining = len(stream.send_buffer)
-                                    logger.info(
-                                        "CONNACK flush: sent stream packet stream_id=%s pkt_len=%s consumed=%s remaining=%s",
+                                    logger.debug(
+                                        "CONNACK flush: sent stream packet stream_id=%s pkt_len=%s consumed=%s remaining=%s conn=%s",
                                         stream_id, pkt_len, consumed, remaining,
+                                        self.dcid.hex()[:16] if self.dcid else "?",
                                     )
                                     self._run_write_pkt_burst(max_packets=3)
                                 else:
@@ -1137,9 +1162,10 @@ class NGTCP2Connection:
                                                 stream.send_buffer.clear()
                                             else:
                                                 del stream.send_buffer[:consumed]
-                                            logger.info(
-                                                "CONNACK flush: sent stream packet (retry) stream_id=%s pkt_len=%s consumed=%s remaining=%s",
+                                            logger.debug(
+                                                "CONNACK flush (retry): stream_id=%s pkt_len=%s consumed=%s remaining=%s conn=%s",
                                                 stream_id, pkt_len, consumed, len(stream.send_buffer),
+                                                self.dcid.hex()[:16] if self.dcid else "?",
                                             )
                                     break
                                 if rv != 0:
@@ -1344,18 +1370,22 @@ class NGTCP2Connection:
     
     async def _process_streams(self):
         """
-        Process stream data and trigger MQTT handler
+        Process stream data and trigger MQTT handler (once per stream).
         
-        This task runs after handshake completes to process
-        incoming stream data and handle MQTT messages.
+        Runs the MQTT handler only once per connection; once it exits (DISCONNECT,
+        error, etc.), we do not re-invoke. Re-invoking on leftover stream data
+        caused "index out of range" (handler expected CONNECT but got junk).
         """
         while self.state == "connected" and self.conn:
             try:
-                # Check all streams for data
                 for stream_id, stream in list(self.streams.items()):
-                    if stream.has_data() and self.server.mqtt_handler:
-                        logger.info("QUIC invoking MQTT handler: stream_id=%s conn=%s", stream_id, self.dcid.hex()[:8])
-                        # Process MQTT data on this stream
+                    if (
+                        stream.has_data()
+                        and not stream.mqtt_handler_started
+                        and self.server.mqtt_handler
+                    ):
+                        stream.mqtt_handler_started = True
+                        logger.debug("QUIC invoking MQTT handler: stream_id=%s conn=%s", stream_id, self.dcid.hex()[:8])
                         await self.server._handle_mqtt_over_quic(self, stream)
                 
                 await asyncio.sleep(0.01)  # Check every 10ms
@@ -1372,17 +1402,16 @@ class NGTCP2Connection:
             return
         
         try:
-            # ngtcp2 asserts conn->log.last_ts <= ts in conn_update_timestamp. Use a timestamp
-            # strictly in the future so no concurrent recv/expiry can advance last_ts past it
-            # (avoids assertion/crash on Ctrl+C shutdown).
+            # ngtcp2 asserts conn->log.last_ts <= ts in conn_update_timestamp.
+            # Use ngtcp2's last_ts + 1 as source of truth; avoid future offsets that can
+            # race with packet processing and cause last_ts > ts assertion failures.
             now_ns = time.monotonic_ns()
             with self._ts_lock:
                 last_ts = getattr(self, "_last_ts", now_ns)
                 timestamp = max(now_ns, last_ts + 1)
                 if ngtcp2_conn_get_timestamp and self._conn_ptr:
-                    timestamp = max(timestamp, ngtcp2_conn_get_timestamp(self._conn_ptr) + 1)
-                # Ensure ts is ahead of any possible last_ts (60s in future so shutdown never asserts)
-                timestamp = max(timestamp, now_ns + 60_000_000_000)
+                    ts_from_ngtcp2 = ngtcp2_conn_get_timestamp(self._conn_ptr)
+                    timestamp = max(timestamp, ts_from_ngtcp2 + 1)
                 self._last_ts = timestamp
             if ngtcp2_conn_close:
                 # ngtcp2_conn_close is a wrapper that handles packet sending
@@ -1561,11 +1590,29 @@ class QUICServerNGTCP2:
     
     async def _connection_maintenance(self):
         """Periodic connection maintenance (expiry, timeouts)"""
+        app_idle_sec = int(os.environ.get("MQTTD_APP_IDLE_TIMEOUT_SECONDS", "90"))
         while self.transport and not self.transport.is_closing():
             try:
                 timestamp = time.monotonic_ns()
-                
-                # Handle expiry for all connections
+                now_sec = time.time()
+
+                # App-level idle timeout: close connections with no MQTT activity.
+                # Mark closed and let cleanup() remove; avoid conn.close() which calls
+                # ngtcp2_conn_close - that can hit conn_update_timestamp assertion when
+                # packet handling races with maintenance (last_ts > ts).
+                for conn in list(self.connections.values()):
+                    if conn.state == "connected" and app_idle_sec > 0:
+                        idle = now_sec - getattr(conn, "last_mqtt_activity", now_sec)
+                        if idle >= app_idle_sec:
+                            logger.info(
+                                "App idle timeout (%ds) for connection %s, closing",
+                                app_idle_sec,
+                                conn.dcid.hex()[:8],
+                            )
+                            conn.state = "closed"
+                            continue
+
+                # Handle expiry for all connections (QUIC transport timeout)
                 for conn in list(self.connections.values()):
                     conn.handle_expiry(timestamp)
                     conn.send_packets(timestamp)

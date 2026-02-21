@@ -5,10 +5,11 @@ MQTTD Application - FastAPI-like MQTT Server
 import asyncio
 import base64
 import json
-import ssl
 import logging
+import ssl
 import struct
 import secrets
+import time
 import uuid
 from typing import Optional, Dict, List, Callable, Any, Tuple, Set, Union
 from pathlib import Path
@@ -362,8 +363,15 @@ class MQTTApp:
             else:
                 payload_data = b''
             
-            # Parse CONNECT
-            connect_info = MQTTProtocol.parse_connect(payload_data)
+            # Minimum CONNECT payload: protocol name (2+4) + level (1) + flags (1) + keepalive (2) = 10 bytes
+            if len(payload_data) < 10:
+                raise ValueError(f"CONNECT payload too short: {len(payload_data)} bytes")
+            
+            # Parse CONNECT (catch IndexError from truncated/corrupt stream data)
+            try:
+                connect_info = MQTTProtocol.parse_connect(payload_data)
+            except IndexError as e:
+                raise ValueError(f"Malformed CONNECT (truncated/corrupt): {e}") from e
             
             # [MQTT-3.1.2-3] Reserved flag (bit 0) in Connect Flags MUST be 0
             if (connect_info.get('connect_flags', 0) & 0x01) != 0:
@@ -409,17 +417,21 @@ class MQTTApp:
                 session_expiry_interval = 0
             
             # Create client object
+            client_sock = writer.get_extra_info('socket')
+            connection_id = None
+            if hasattr(client_sock, 'dcid') and client_sock.dcid:
+                connection_id = client_sock.dcid.hex()[:16]
             client = MQTTClient(
                 client_id=connect_info['client_id'],
                 username=connect_info.get('username'),
                 password=connect_info.get('password'),
                 keepalive=connect_info['keepalive'],
                 clean_session=clean_start,  # Use clean_start for consistency
-                address=writer.get_extra_info('peername')
+                address=writer.get_extra_info('peername'),
+                connection_id=connection_id,
             )
             
             # Store protocol version for this client
-            client_sock = writer.get_extra_info('socket')
             client._protocol_version = protocol_level  # Store for later use
             
             # Cancel any pending Will for this client (reconnect within Will Delay Interval)
@@ -858,26 +870,40 @@ class MQTTApp:
         """
         Send a PUBLISH to a single client (e.g. to confirm "received").
         Returns True if sent, False if client not found or send failed.
+        When client.connection_id is set (QUIC), only sends on the same connection that received the request.
         """
         for client_sock, (stored_client, writer) in list(self._clients.items()):
             if stored_client.client_id != client.client_id:
                 continue
+            # Bind to same connection when connection_id is set (QUIC: ensure reply on same conn that received PUBLISH)
+            if client.connection_id is not None:
+                sock_conn_id = None
+                if hasattr(client_sock, 'dcid') and client_sock.dcid:
+                    sock_conn_id = client_sock.dcid.hex()[:16]
+                if sock_conn_id != client.connection_id:
+                    continue
             try:
                 is_mqtt5 = hasattr(client, '_protocol_version') and client._protocol_version == MQTTProtocol.PROTOCOL_LEVEL_5_0
                 if is_mqtt5:
                     publish_msg = MQTT5Protocol.build_publish_v5(
-                        topic=topic, payload=payload, packet_id=None, qos=qos, retain=retain
+                        topic=topic, payload=payload, packet_id=None, qos=qos, retain=retain,
+                        payload_format_indicator=1,  # UTF-8 (for JSON responses)
                     )
                 else:
                     publish_msg = MQTTProtocol.build_publish(topic, payload, None, qos, retain)
                 writer.write(publish_msg)
                 await writer.drain()
-                logger.debug(f"Sent to client {client.client_id} on topic: {topic}")
                 return True
             except Exception as e:
-                logger.debug(f"Failed to send to client {client.client_id}: {e}")
+                logger.warning(
+                    "Failed to send to client %s topic=%s: %s",
+                    client.client_id, topic, e,
+                )
                 return False
-        logger.debug(f"Client {client.client_id} not found for publish_to_client")
+        logger.warning(
+            "Client %s not found for publish_to_client (topic=%s, _clients=%s)",
+            client.client_id, topic, len(self._clients),
+        )
         return False
     
     async def _handle_subscribe(self, reader: asyncio.StreamReader,
@@ -912,8 +938,9 @@ class MQTTApp:
             
             logger.info(f"SUBSCRIBE: packet_id={packet_id}, filters={len(filters)}, sub_id={subscription_identifier}")
             
-            client_sock = writer.get_extra_info('socket')
-            
+            client_sock = writer.get_extra_info("socket")
+            self._touch_mqtt_activity(client_sock)
+
             # Check subscription rate limiting (one check per SUBSCRIBE packet)
             if not self._check_rate_limit(client_sock, check_subscription=True):
                 logger.warning(f"Subscription rate limited for client {client_sock}")
@@ -1133,6 +1160,11 @@ class MQTTApp:
         self._rate_limits[client_sock] = (msg_count, window_start, sub_count)
         return True
     
+    def _touch_mqtt_activity(self, client_sock) -> None:
+        """Update last_mqtt_activity for QUIC connections (NGTCP2Connection)."""
+        if hasattr(client_sock, "last_mqtt_activity"):
+            client_sock.last_mqtt_activity = time.time()
+
     async def _handle_publish(self, reader: asyncio.StreamReader,
                              writer: asyncio.StreamWriter,
                              client: MQTTClient,
@@ -1140,8 +1172,9 @@ class MQTTApp:
                              remaining_length: int) -> bool:
         """Handle MQTT PUBLISH message - publish to Redis channel"""
         try:
-            client_sock = writer.get_extra_info('socket')
-            
+            client_sock = writer.get_extra_info("socket")
+            self._touch_mqtt_activity(client_sock)
+
             # Check rate limiting
             if not self._check_rate_limit(client_sock, check_subscription=False):
                 # Rate limited - could send error response, but for now just log and skip
@@ -1221,7 +1254,7 @@ class MQTTApp:
             # Store subscription identifiers for forwarding
             message._subscription_identifiers = subscription_identifiers if is_mqtt5 else []
             
-            logger.info(f"PUBLISH: topic={message.topic}, payload_len={len(message.payload)}")
+            logger.info(f"PUBLISH: client_id={client.client_id}, topic={message.topic}, payload_len={len(message.payload)}")
             
             # Update metrics
             self._metrics['total_messages_received'] += 1
@@ -1491,17 +1524,30 @@ class MQTTApp:
                         break
                         
                 except asyncio.TimeoutError:
-                    logger.info("Client timeout")
+                    client_id = client.client_id if client else "unknown"
+                    logger.info(f"Client timeout: client_id={client_id}")
                     break
                 except asyncio.IncompleteReadError:
-                    logger.info("Client disconnected")
+                    client_id = client.client_id if client else "unknown"
+                    logger.info(f"Client disconnected: client_id={client_id}")
                     break
                 except (IndexError, ValueError) as e:
                     # Stream reset or partial data can leave corrupt payloads; treat as disconnect
-                    logger.info("Client connection closed (stream reset or invalid data): %s", e)
+                    client_id = client.client_id if client else "unknown"
+                    logger.info(f"Client connection closed (stream reset or invalid data): client_id={client_id}, err={e}")
                     break
                 except Exception as e:
-                    logger.error(f"Error in message loop: {e}")
+                    client_id = client.client_id if client else "unknown"
+                    err_msg = str(e)
+                    if "Stream closed" in err_msg:
+                        # Server does not close the stream; peer closed or QUIC idle/timeout did.
+                        # QUIC idle timeout is MQTTD_QUIC_IDLE_TIMEOUT_SECONDS (default 90s).
+                        logger.error(
+                            f"Error in message loop: client_id={client_id}, err={e}. "
+                            "Stream was closed by peer or transport (server idle timeout)."
+                        )
+                    else:
+                        logger.error(f"Error in message loop: client_id={client_id}, err={e}")
                     break
         
         except Exception as e:
@@ -1570,8 +1616,9 @@ class MQTTApp:
             await writer.drain()
             logger.debug("Sent PINGRESP")
             
-            # Update keepalive activity
-            client_sock = writer.get_extra_info('socket')
+            # Update keepalive activity (TCP) / last_mqtt_activity (QUIC)
+            client_sock = writer.get_extra_info("socket")
+            self._touch_mqtt_activity(client_sock)
             if client_sock in self._client_keepalive:
                 current_time = asyncio.get_event_loop().time()
                 keepalive_seconds = self._client_keepalive[client_sock][1]
@@ -1595,8 +1642,9 @@ class MQTTApp:
             
             logger.info(f"UNSUBSCRIBE: packet_id={packet_id}, topics={topics}")
             
-            client_sock = writer.get_extra_info('socket')
-            
+            client_sock = writer.get_extra_info("socket")
+            self._touch_mqtt_activity(client_sock)
+
             # Remove subscriptions
             for topic in topics:
                 shared = parse_shared_subscription(topic)

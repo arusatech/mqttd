@@ -14,7 +14,7 @@ from .protocol_v5 import MQTT5Protocol
 from .properties import PropertyEncoder, PropertyType
 from .reason_codes import ReasonCode
 
-__version__ = "0.5.2"  # QUIC TLS full-chain (SSL_CTX_use_certificate_chain_file)
+__version__ = "0.5.3"  # QUIC TLS full-chain (SSL_CTX_use_certificate_chain_file)
 __all__ = [
     "MQTTApp", 
     "subscribe", 

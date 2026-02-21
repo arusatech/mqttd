@@ -44,6 +44,7 @@ class MQTTClient:
     keepalive: int = 60
     clean_session: bool = True
     address: Optional[tuple] = None  # (host, port)
+    connection_id: Optional[str] = None  # QUIC dcid hex (first 16 chars) for connection correlation
     
     def __str__(self) -> str:
         return f"MQTTClient(id={self.client_id}, user={self.username})"
